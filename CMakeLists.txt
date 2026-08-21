@@ -111,6 +111,11 @@ if(LENSSERIOUS_TESTS)
       # Not a test: it measures, it does not assert. Run it by hand.
       add_executable(bench_lensfun tests/bench_lensfun.c)
       target_link_libraries(bench_lensfun PRIVATE lensserious_db PkgConfig::LENSFUN m)
+      # A pixel pipeline runs these stages across threads; measure them that way too.
+      find_package(OpenMP COMPONENTS C)
+      if(OpenMP_C_FOUND)
+        target_link_libraries(bench_lensfun PRIVATE OpenMP::OpenMP_C)
+      endif()
       target_compile_options(bench_lensfun PRIVATE -Wall -Wextra)
       set_target_properties(bench_lensfun PROPERTIES C_STANDARD 11)
       set_tests_properties(db_match PROPERTIES FIXTURES_REQUIRED LENSDB)

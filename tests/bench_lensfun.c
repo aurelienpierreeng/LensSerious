@@ -11,9 +11,15 @@
  * that claim against liblensfun, stage by stage, rather than as one number -- because the
  * stages differ by wildly different factors and a single figure would flatter it.
  *
- * Everything here is single-threaded and CPU-side on both sides, deliberately. The GPU
- * numbers live in Ansel, where the kernel that consumes the map can be measured end to
- * end; comparing a GPU kernel against a CPU callback would prove nothing about the design.
+ * Everything here is CPU-side on both sides, deliberately. The GPU numbers live in
+ * tests/bench_opencl.c and in Ansel; comparing a GPU kernel against a CPU callback would
+ * prove nothing about the design.
+ *
+ * The two per-pixel stages are measured BOTH single-threaded and across OpenMP threads,
+ * because a pixel pipeline runs them in parallel and the two libraries need not scale the
+ * same way. Rows are independent in both -- lensfun's modifier is const during apply and
+ * writes only the caller's buffer, which is what lets Ansel parallelise it too -- so this
+ * is a fair test of the same work, not of one library's threading model.
  *
  * Run it with the database built by tools/import_lensfun_xml.c:
  *     bench_lensfun lenses.db [megapixels]
@@ -27,12 +33,34 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef _OPENMP
+  #include <omp.h>
+#endif
+
 static double now_ms(void)
 {
   struct timespec t;
   clock_gettime(CLOCK_MONOTONIC, &t);
   return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
+
+/* Each timed stage runs REPEATS times and the BEST is kept. A shared machine only ever
+ * makes a measurement slower, never faster, so the minimum is the closest thing to the
+ * cost of the code; the mean measures the machine's other tenants. Taking one sample gave
+ * lensfun's single-threaded map as 333 ms in one run and 532 ms in the next. */
+enum { REPEATS = 3 };
+
+#define TIME_BEST(best, body)                                                             \
+  do {                                                                                     \
+    (best) = 1e30;                                                                         \
+    for(int _r = 0; _r < REPEATS; _r++)                                                    \
+    {                                                                                      \
+      const double _t0 = now_ms();                                                         \
+      body;                                                                                \
+      const double _d = now_ms() - _t0;                                                    \
+      if(_d < (best)) (best) = _d;                                                          \
+    }                                                                                      \
+  } while(0)
 
 static void row(const char *what, double lf, double ls, const char *unit)
 {
@@ -150,17 +178,42 @@ int main(int argc, char **argv)
   lfModifier *m = lf_modifier_new(lf, crop, W, H);
   lf_modifier_initialize(m, lf, LF_PF_F32, focal, aperture, distance, 1.f, LF_RECTILINEAR,
                          LF_MODIFY_DISTORTION | LF_MODIFY_TCA, 0);
-  t = now_ms();
-  for(int y = 0; y < H; y++) lf_modifier_apply_subpixel_geometry_distortion(m, 0.f, (float)y, W, 1, buf);
-  const double t_lf_map = now_ms() - t;
-  lf_modifier_destroy(m);
+  double t_lf_map;
+  TIME_BEST(t_lf_map,
+            for(int y = 0; y < H; y++)
+              lf_modifier_apply_subpixel_geometry_distortion(m, 0.f, (float)y, W, 1, buf));
 
   ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f, LS_LENS_UNKNOWN,
                    LS_ENABLE_DISTORTION | LS_ENABLE_TCA);
-  t = now_ms();
-  for(int y = 0; y < H; y++) ls_modifier_apply_subpixel_geometry(&mod, 0.f, (float)y, W, 1, buf);
-  const double t_ls_map = now_ms() - t;
+  double t_ls_map;
+  TIME_BEST(t_ls_map,
+            for(int y = 0; y < H; y++)
+              ls_modifier_apply_subpixel_geometry(&mod, 0.f, (float)y, W, 1, buf));
   row("build the whole geometry map", t_lf_map, t_ls_map, "ms");
+
+  /* The same work across threads. Each thread writes its own row of the shared map, so the
+   * only thing shared for writing is the buffer, and no two threads touch the same bytes. */
+  double t_lf_map_mt = 0.0, t_ls_map_mt = 0.0;
+#ifdef _OPENMP
+  {
+    float *big = (float *)malloc((size_t)W * H * 6 * sizeof(float));
+    if(big)
+    {
+      TIME_BEST(t_lf_map_mt,
+                _Pragma("omp parallel for schedule(static)")
+                for(int y = 0; y < H; y++)
+                  lf_modifier_apply_subpixel_geometry_distortion(m, 0.f, (float)y, W, 1,
+                                                                 big + (size_t)y * W * 6));
+      TIME_BEST(t_ls_map_mt,
+                _Pragma("omp parallel for schedule(static)")
+                for(int y = 0; y < H; y++)
+                  ls_modifier_apply_subpixel_geometry(&mod, 0.f, (float)y, W, 1,
+                                                      big + (size_t)y * W * 6));
+      free(big);
+    }
+  }
+#endif
+  lf_modifier_destroy(m);
 
   /* --- 5. vignetting over the whole frame ------------------------------- */
 
@@ -171,20 +224,67 @@ int main(int argc, char **argv)
   m = lf_modifier_new(lf, crop, W, H);
   lf_modifier_initialize(m, lf, LF_PF_F32, focal, aperture, distance, 1.f, LF_RECTILINEAR,
                          LF_MODIFY_VIGNETTING, 0);
-  t = now_ms();
-  for(int y = 0; y < H; y++)
-    lf_modifier_apply_color_modification(m, rgba, 0.f, (float)y, W, 1,
-                                         LF_CR_4(RED, GREEN, BLUE, UNKNOWN), W * 4 * (int)sizeof(float));
-  const double t_lf_vig = now_ms() - t;
+  double t_lf_vig;
+  TIME_BEST(t_lf_vig,
+            for(int y = 0; y < H; y++)
+              lf_modifier_apply_color_modification(m, rgba, 0.f, (float)y, W, 1,
+                                                   LF_CR_4(RED, GREEN, BLUE, UNKNOWN),
+                                                   W * 4 * (int)sizeof(float)));
   lf_modifier_destroy(m);
 
   ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f, LS_LENS_UNKNOWN,
                    LS_ENABLE_VIGNETTING);
-  t = now_ms();
-  for(int y = 0; y < H; y++)
-    ls_modifier_apply_vignetting(&mod, 0.f, (float)y, W, 1, rgba, W * 4 * (int)sizeof(float));
-  const double t_ls_vig = now_ms() - t;
+  double t_ls_vig;
+  TIME_BEST(t_ls_vig,
+            for(int y = 0; y < H; y++)
+              ls_modifier_apply_vignetting(&mod, 0.f, (float)y, W, 1, rgba,
+                                           W * 4 * (int)sizeof(float)));
   row("apply vignetting, whole frame", t_lf_vig, t_ls_vig, "ms");
+
+  double t_lf_vig_mt = 0.0, t_ls_vig_mt = 0.0;
+#ifdef _OPENMP
+  {
+    float *big = (float *)malloc((size_t)W * H * 4 * sizeof(float));
+    if(big)
+    {
+      for(size_t i = 0; i < (size_t)W * H * 4; i++) big[i] = 0.5f;
+      lfModifier *vm = lf_modifier_new(lf, crop, W, H);
+      lf_modifier_initialize(vm, lf, LF_PF_F32, focal, aperture, distance, 1.f, LF_RECTILINEAR,
+                             LF_MODIFY_VIGNETTING, 0);
+      TIME_BEST(t_lf_vig_mt,
+                _Pragma("omp parallel for schedule(static)")
+                for(int y = 0; y < H; y++)
+                  lf_modifier_apply_color_modification(vm, big + (size_t)y * W * 4, 0.f,
+                                                       (float)y, W, 1,
+                                                       LF_CR_4(RED, GREEN, BLUE, UNKNOWN),
+                                                       W * 4 * (int)sizeof(float)));
+      lf_modifier_destroy(vm);
+
+      ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f, LS_LENS_UNKNOWN,
+                       LS_ENABLE_VIGNETTING);
+      TIME_BEST(t_ls_vig_mt,
+                _Pragma("omp parallel for schedule(static)")
+                for(int y = 0; y < H; y++)
+                  ls_modifier_apply_vignetting(&mod, 0.f, (float)y, W, 1,
+                                               big + (size_t)y * W * 4,
+                                               W * 4 * (int)sizeof(float)));
+      free(big);
+    }
+  }
+#endif
+
+#ifdef _OPENMP
+  if(t_lf_map_mt > 0.0)
+  {
+    printf("\n  the same two stages across %d OpenMP threads\n", omp_get_max_threads());
+    row("build the whole geometry map", t_lf_map_mt, t_ls_map_mt, "ms");
+    row("apply vignetting, whole frame", t_lf_vig_mt, t_ls_vig_mt, "ms");
+    printf("  %-34s %10.2fx %9.2fx\n", "  scaling vs. its own 1 thread",
+           t_lf_map / t_lf_map_mt, t_ls_map / t_ls_map_mt);
+  }
+#else
+  (void)t_lf_map_mt; (void)t_ls_map_mt; (void)t_lf_vig_mt; (void)t_ls_vig_mt;
+#endif
 
   /* --- what a session actually pays ------------------------------------- */
 
