@@ -81,6 +81,13 @@ if(LENSSERIOUS_TESTS)
                COMMAND import_lensfun_xml ${CMAKE_CURRENT_SOURCE_DIR}/src/schema.sql
                        ${CMAKE_CURRENT_BINARY_DIR}/lenses.db)
       add_test(NAME db_parity COMMAND parity_db ${CMAKE_CURRENT_BINARY_DIR}/lenses.db)
+
+      add_executable(match_lensfun tests/match_lensfun.c)
+      target_link_libraries(match_lensfun PRIVATE lensserious_db PkgConfig::LENSFUN)
+      target_compile_options(match_lensfun PRIVATE -Wall -Wextra)
+      set_target_properties(match_lensfun PROPERTIES C_STANDARD 11)
+      add_test(NAME db_match COMMAND match_lensfun ${CMAKE_CURRENT_BINARY_DIR}/lenses.db)
+      set_tests_properties(db_match PROPERTIES FIXTURES_REQUIRED LENSDB)
       set_tests_properties(db_import PROPERTIES FIXTURES_SETUP LENSDB)
       set_tests_properties(db_parity PROPERTIES FIXTURES_REQUIRED LENSDB)
     endif()

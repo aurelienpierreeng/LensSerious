@@ -492,3 +492,216 @@ int ls_db_meta(ls_db_t *db, const char *key, char *out, size_t out_size)
   sqlite3_finalize(st);
   return n;
 }
+
+/* ------------------------------------------------------------------------- */
+/* Fuzzy matching.                                                            */
+/*                                                                            */
+/* A raw file names a lens the way its vendor abbreviates it, and upstream     */
+/* names it the way upstream chose. "16-35mm f/4G ED VR" has to reach "Nikon   */
+/* AF-S Nikkor 16-35mm f/4G ED VR" with most of the tokens missing.            */
+/*                                                                            */
+/* The weights below are not derived from anything: they were calibrated       */
+/* against liblensfun's own decisions, which tests/match_lensfun.c re-checks    */
+/* over the whole database. Change one and run that test.                      */
+/* ------------------------------------------------------------------------- */
+
+enum { LS_MAX_TOKENS = 32, LS_TOKEN_LEN = 48 };
+
+typedef struct
+{
+  char t[LS_MAX_TOKENS][LS_TOKEN_LEN];
+  int n;
+} ls_tokens_t;
+
+/** @brief Split a normalised name on spaces, and split letter/digit runs apart.
+ *
+ * @details "16-35mm" normalises to "1635mm" -- no. Normalisation drops '-', so the two
+ * halves of a focal range would fuse into one meaningless token and stop matching the
+ * catalogue's "16 35mm". Splitting where a digit meets a letter, and where a letter meets
+ * a digit, keeps "16", "35", "mm", "f", "4g" as separate comparable units. */
+static void _tokenize(const char *norm, ls_tokens_t *out)
+{
+  out->n = 0;
+  const char *p = norm;
+  while(*p && out->n < LS_MAX_TOKENS)
+  {
+    while(*p == ' ') p++;
+    if(!*p) break;
+
+    char *w = out->t[out->n];
+    int len = 0;
+    int prev_digit = -1;
+    while(*p && *p != ' ' && len < LS_TOKEN_LEN - 1)
+    {
+      const int is_digit = (*p >= '0' && *p <= '9');
+      if(prev_digit >= 0 && is_digit != prev_digit) break;   /* letter<->digit boundary */
+      w[len++] = *p++;
+      prev_digit = is_digit;
+    }
+    w[len] = '\0';
+    if(len) out->n++;
+  }
+}
+
+/**
+ * @brief How well @p pat's tokens are covered by @p cand's, 0..100.
+ *
+ * @details Asymmetric on purpose. The pattern is what the camera wrote and the candidate
+ * is the catalogue entry, so every pattern token ought to appear in the candidate --
+ * missing one is evidence against the match. The reverse is not true: the catalogue is
+ * more verbose than any EXIF field, and penalising it for that would favour the shortest
+ * name in the database for every query.
+ *
+ * Unmatched candidate tokens are still worth a small penalty, or "35mm" would score the
+ * same against every 35mm lens ever made; it is just much smaller than the forward one.
+ */
+static float _score_tokens(const ls_tokens_t *pat, const ls_tokens_t *cand)
+{
+  if(pat->n == 0 || cand->n == 0) return 0.f;
+
+  int used[LS_MAX_TOKENS] = { 0 };
+  float got = 0.f;
+
+  for(int i = 0; i < pat->n; i++)
+  {
+    float best = 0.f;
+    int best_j = -1;
+    for(int j = 0; j < cand->n; j++)
+    {
+      if(used[j]) continue;
+      float s = 0.f;
+      if(strcmp(pat->t[i], cand->t[j]) == 0)
+        s = 1.f;
+      else
+      {
+        /* A prefix is weak evidence: "nikkor" vs "nikkor" is a match, "af" vs "afs" is a
+         * hint. Anything shorter than three characters is noise, not a hint. */
+        const size_t li = strlen(pat->t[i]), lj = strlen(cand->t[j]);
+        const size_t lmin = (li < lj) ? li : lj;
+        if(lmin >= 3 && strncmp(pat->t[i], cand->t[j], lmin) == 0)
+          s = 0.5f * (float)lmin / (float)((li > lj) ? li : lj);
+      }
+      if(s > best)
+      {
+        best = s;
+        best_j = j;
+      }
+    }
+    if(best_j >= 0 && best > 0.f)
+    {
+      used[best_j] = 1;
+      got += best;
+    }
+  }
+
+  const float forward = got / (float)pat->n;                    /* pattern covered */
+  int unmatched = 0;
+  for(int j = 0; j < cand->n; j++) if(!used[j]) unmatched++;
+  const float verbosity = (float)unmatched / (float)cand->n;    /* candidate's extra words */
+
+  float score = 100.f * (forward - 0.15f * verbosity * forward);
+  if(score < 0.f) score = 0.f;
+  return score;
+}
+
+int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long long mount_id,
+                     ls_db_match_t *out, int max)
+{
+  if(!db || !db->sql || !model || !out || max <= 0) return -1;
+
+  char nmodel[512], nmaker[512];
+  ls_db_normalize(model, nmodel, sizeof(nmodel));
+  ls_db_normalize(maker, nmaker, sizeof(nmaker));
+
+  ls_tokens_t pat, pat_maker;
+  _tokenize(nmodel, &pat);
+  _tokenize(nmaker, &pat_maker);
+  if(pat.n == 0) return 0;
+
+  /* One scan over the name table, scored in C. At ~3000 rows this is microseconds, and it
+   * keeps the scoring in one readable place instead of spread across SQL expressions that
+   * cannot be unit-tested. The mount filter is pushed into SQL because it is selective. */
+  sqlite3_stmt *st = NULL;
+  const char *sql =
+      (mount_id > 0)
+          ? "SELECT n.lens_id, n.norm, n.kind FROM lens_name n"
+            " WHERE EXISTS (SELECT 1 FROM lens_mount lm WHERE lm.lens_id = n.lens_id AND ("
+            "   lm.mount_id = ?1 OR EXISTS (SELECT 1 FROM mount_compat mc"
+            "     WHERE mc.mount_id = ?1 AND mc.compat_id = lm.mount_id)))"
+          : "SELECT n.lens_id, n.norm, n.kind FROM lens_name n";
+  if(sqlite3_prepare_v2(db->sql, sql, -1, &st, NULL) != SQLITE_OK)
+  {
+    _db_err(db, "prepare match");
+    return -1;
+  }
+  if(mount_id > 0) sqlite3_bind_int64(st, 1, mount_id);
+
+  /* Best score per lens, kept in a small open-addressed table: a lens has several names
+   * and several of them may score, but only its best counts. */
+  enum { SLOTS = 4096 };
+  long long *ids = (long long *)calloc(SLOTS, sizeof(long long));
+  float *best = (float *)calloc(SLOTS, sizeof(float));
+  float *maker_bonus = (float *)calloc(SLOTS, sizeof(float));
+  if(!ids || !best || !maker_bonus)
+  {
+    free(ids); free(best); free(maker_bonus);
+    sqlite3_finalize(st);
+    return -1;
+  }
+
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    const long long id = sqlite3_column_int64(st, 0);
+    const char *norm = (const char *)sqlite3_column_text(st, 1);
+    const char *kind = (const char *)sqlite3_column_text(st, 2);
+    if(!norm || !kind) continue;
+
+    ls_tokens_t cand;
+    _tokenize(norm, &cand);
+
+    size_t slot = (size_t)id % SLOTS;
+    while(ids[slot] && ids[slot] != id) slot = (slot + 1) % SLOTS;
+    ids[slot] = id;
+
+    if(kind[0] == 'm' && kind[1] == 'o')          /* "model" */
+    {
+      const float s = _score_tokens(&pat, &cand);
+      if(s > best[slot]) best[slot] = s;
+    }
+    else if(pat_maker.n)                          /* "maker" */
+    {
+      /* The maker is corroboration, not a filter: vendors and upstream disagree about
+       * their own names often enough ("Nikon Corporation" vs "Nikon") that requiring it
+       * loses more matches than the false positives it prevents. */
+      const float s = _score_tokens(&pat_maker, &cand);
+      if(s > maker_bonus[slot]) maker_bonus[slot] = s;
+    }
+  }
+  sqlite3_finalize(st);
+
+  int n = 0;
+  for(size_t slot = 0; slot < SLOTS; slot++)
+  {
+    if(!ids[slot] || best[slot] <= 0.f) continue;
+    const float score = best[slot] + 0.10f * maker_bonus[slot];
+
+    /* Insertion sort into the caller's top-N: max is small (a GUI shows a handful). */
+    int at = n;
+    while(at > 0 && out[at - 1].score < score)
+    {
+      if(at < max) out[at] = out[at - 1];
+      at--;
+    }
+    if(at < max)
+    {
+      out[at].lens_id = ids[slot];
+      out[at].score = score;
+      if(n < max) n++;
+    }
+  }
+
+  free(ids);
+  free(best);
+  free(maker_bonus);
+  return n;
+}

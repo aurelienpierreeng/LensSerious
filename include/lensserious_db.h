@@ -137,6 +137,36 @@ int ls_db_find_camera(ls_db_t *db, const char *maker, const char *model, ls_came
 int ls_db_find_lens(ls_db_t *db, const char *maker, const char *model, float crop,
                     ls_lens_t *out);
 
+/** One candidate from ls_db_match_lens(), best score first. */
+typedef struct ls_db_match_t
+{
+  long long lens_id;
+  float score;        /**< 0..100; 100 is an exact match of every token, both ways. */
+} ls_db_match_t;
+
+/**
+ * @brief Find the lenses a free-text name most likely refers to.
+ *
+ * @details ls_db_find_lens() answers "is there a lens called exactly this". This answers
+ * the question a raw file actually asks, where the EXIF string is a vendor's abbreviation
+ * of the name upstream chose -- "16-35mm f/4G ED VR" against "Nikon AF-S Nikkor 16-35mm
+ * f/4G ED VR", with tokens missing, reordered, or spelled differently.
+ *
+ * Scoring is token-based and deliberately simple; see the implementation for what each
+ * weight is and why. It is calibrated against liblensfun's own decisions rather than
+ * against a specification: tests/match_lensfun.c asks both this and lf_db_find_lenses_hd()
+ * the same questions over the whole database and reports where they disagree.
+ *
+ * @param maker may be NULL. When given it is scored, not required -- vendors disagree with
+ * upstream about their own name often enough that requiring it loses more than it saves.
+ * @param mount_id when > 0, only lenses that fit this mount are considered
+ * (ls_db_find_camera() supplies it). 0 considers every lens.
+ * @param out caller's array, @p max entries, filled best-first.
+ * @return how many candidates were written, or -1 on error.
+ */
+int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long long mount_id,
+                     ls_db_match_t *out, int max);
+
 /** @brief Load a lens by its database id, for a caller that already resolved one. */
 int ls_db_lens_by_id(ls_db_t *db, long long lens_id, ls_lens_t *out);
 
