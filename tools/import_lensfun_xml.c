@@ -135,6 +135,14 @@ static void insert_name(const char *lang, const char *value, void *ud)
   else sqlite3_bind_null(c->st, 3);
   sqlite3_bind_text(c->st, 4, value, -1, SQLITE_TRANSIENT);
   sqlite3_bind_text(c->st, 5, norm, -1, SQLITE_TRANSIENT);
+  /* Only lens names carry a token digest -- camera lookups are exact and never score -- and
+   * camera_name has no such column, so this statement has five parameters, not six. */
+  if(c->tok)
+  {
+    unsigned char digest[2 + 32 * 5];
+    const size_t dn = ls_db_token_digest(norm, digest, sizeof(digest));
+    sqlite3_bind_blob(c->st, 6, digest, (int)dn, SQLITE_TRANSIENT);
+  }
   step_reset(c->db, c->st);
 
   if(!c->tok) return;
@@ -310,8 +318,8 @@ int main(int argc, char **argv)
   sqlite3_stmt *ins_lens = prep(db, "INSERT INTO lens(maker, model, type, crop_factor, aspect_ratio,"
                                     " center_x, center_y, min_focal, max_focal, min_aperture, max_aperture)"
                                     " VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)");
-  sqlite3_stmt *ins_lens_name = prep(db, "INSERT INTO lens_name(lens_id, kind, lang, value, norm)"
-                                         " VALUES (?1, ?2, ?3, ?4, ?5)");
+  sqlite3_stmt *ins_lens_name = prep(db, "INSERT INTO lens_name(lens_id, kind, lang, value, norm, tokens)"
+                                         " VALUES (?1, ?2, ?3, ?4, ?5, ?6)");
   sqlite3_stmt *ins_token = prep(db, "INSERT INTO lens_token(lens_id, kind, token)"
                                      " VALUES (?1, ?2, ?3)");
   sqlite3_stmt *ins_lens_mount = prep(db, "INSERT OR IGNORE INTO lens_mount(lens_id, mount_id) VALUES (?1, ?2)");

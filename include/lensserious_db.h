@@ -81,6 +81,21 @@ size_t ls_db_normalize(const char *in, char *out, size_t out_size);
  */
 int ls_db_tokenize(const char *norm, char *out_tokens, int max, int stride);
 
+/** @brief FNV-1a of a token, the hash the stored digest and the matcher both use. */
+unsigned ls_db_token_hash(const char *token);
+
+/**
+ * @brief Pack a normalised name's tokens into the digest stored in `lens_name.tokens`.
+ *
+ * @details Layout: `uint16 n`, then n x `uint32` hash, then n x `uint8` length. The matcher
+ * scores on those alone -- it never sees the token text -- which is what lets the candidate
+ * query read a blob out of a covering index instead of decoding and re-tokenising text on
+ * every lookup.
+ *
+ * @return bytes written, or 0 if @p out is too small.
+ */
+size_t ls_db_token_digest(const char *norm, unsigned char *out, size_t out_size);
+
 /** An open database. Not shared between threads; see @ref threading. */
 typedef struct ls_db_t ls_db_t;
 

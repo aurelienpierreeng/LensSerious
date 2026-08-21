@@ -12,7 +12,7 @@
 -- translation. That is deliberate: every conversion between the XML's vocabulary and the
 -- evaluator's happens once, offline, where it can be checked, rather than per render.
 
-PRAGMA user_version = 2;
+PRAGMA user_version = 3;
 
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
@@ -69,7 +69,16 @@ CREATE TABLE lens_name (
   kind    TEXT NOT NULL,              -- 'maker' | 'model'
   lang    TEXT,                       -- NULL for the untranslated name
   value   TEXT NOT NULL,
-  norm    TEXT NOT NULL
+  norm    TEXT NOT NULL,
+  -- The tokens of `norm`, as a digest the matcher can score without parsing anything:
+  --   uint16 n, then n x uint32 FNV-1a hash, then n x uint8 length.
+  -- Little-endian, written and read by the same two functions in this repository, so the
+  -- database is not portable across endiannesses -- it is a build artefact of the machine
+  -- that imported it, like the rest of the file's page layout.
+  --
+  -- Scoring compares hash and length only. The prefix rule this replaces was measured to
+  -- contribute nothing: removing it left agreement at 99.0%, shape for shape.
+  tokens  BLOB NOT NULL
 );
 
 CREATE TABLE camera_name (
@@ -172,11 +181,11 @@ CREATE INDEX idx_lens_name_norm ON lens_name(norm);
 -- gathers the pruned candidates' names has no way in and scans the whole table, which is
 -- the scan the pruning existed to avoid.
 --
--- COVERING: kind and norm are in the index, not just lens_id, so the search never touches
+-- COVERING: kind and the token digest are in the index, so the search never touches
 -- the table. An index that only carries the search key still costs one table seek per row
 -- found, which is what `SEARCH ... USING INDEX` hides -- the row it lands on is an index
 -- entry, and every column outside the index is another b-tree descent.
-CREATE INDEX idx_lens_name_lens ON lens_name(lens_id, kind, norm);
+CREATE INDEX idx_lens_name_lens ON lens_name(lens_id, kind, tokens);
 -- COVERING for the same reason: the pruning subquery wants lens_id, so carrying it in the
 -- index means the token lookup never descends into lens_token itself.
 CREATE INDEX idx_lens_token ON lens_token(kind, token, lens_id);

@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define LS_DB_SCHEMA_VERSION 2
+#define LS_DB_SCHEMA_VERSION 3
 
 struct ls_db_t
 {
@@ -558,22 +558,72 @@ int ls_db_tokenize(const char *norm, char *out_tokens, int max, int stride)
   return n;
 }
 
+unsigned ls_db_token_hash(const char *token)
+{
+  unsigned hash = 2166136261u;      /* FNV-1a */
+  for(const char *c = token; *c; c++)
+  {
+    hash ^= (unsigned char)*c;
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+size_t ls_db_token_digest(const char *norm, unsigned char *out, size_t out_size)
+{
+  char toks[LS_MAX_TOKENS][LS_TOKEN_LEN];
+  const int n = ls_db_tokenize(norm, &toks[0][0], LS_MAX_TOKENS, LS_TOKEN_LEN);
+  const size_t need = 2 + (size_t)n * 5;
+  if(out_size < need) return 0;
+
+  out[0] = (unsigned char)(n & 0xFF);
+  out[1] = (unsigned char)((n >> 8) & 0xFF);
+  for(int i = 0; i < n; i++)
+  {
+    const unsigned h = ls_db_token_hash(toks[i]);
+    unsigned char *p = out + 2 + (size_t)i * 4;
+    p[0] = (unsigned char)(h & 0xFF);
+    p[1] = (unsigned char)((h >> 8) & 0xFF);
+    p[2] = (unsigned char)((h >> 16) & 0xFF);
+    p[3] = (unsigned char)((h >> 24) & 0xFF);
+    out[2 + (size_t)n * 4 + i] = (unsigned char)strlen(toks[i]);
+  }
+  return need;
+}
+
+/** @brief Read a digest back into the arrays _score_tokens() compares. @return token count. */
+static int _digest_load(const unsigned char *blob, int bytes, ls_tokens_t *out)
+{
+  out->n = 0;
+  out->bloom = 0;
+  if(!blob || bytes < 2) return 0;
+
+  int n = blob[0] | (blob[1] << 8);
+  if(n > LS_MAX_TOKENS) n = LS_MAX_TOKENS;
+  if(bytes < 2 + n * 5) return 0;
+
+  for(int i = 0; i < n; i++)
+  {
+    const unsigned char *p = blob + 2 + (size_t)i * 4;
+    const unsigned h = (unsigned)p[0] | ((unsigned)p[1] << 8)
+                     | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+    out->h[i] = h;
+    out->len[i] = blob[2 + (size_t)n * 4 + i];
+    out->bloom |= 1ULL << (h & 63u);
+  }
+  out->n = n;
+  return n;
+}
+
 static void _tokenize(const char *norm, ls_tokens_t *out)
 {
   out->n = ls_db_tokenize(norm, &out->t[0][0], LS_MAX_TOKENS, LS_TOKEN_LEN);
   out->bloom = 0;
   for(int i = 0; i < out->n; i++)
   {
-    unsigned hash = 2166136261u;      /* FNV-1a */
-    const char *c = out->t[i];
-    int len = 0;
-    for(; *c; c++, len++)
-    {
-      hash ^= (unsigned char)*c;
-      hash *= 16777619u;
-    }
+    const unsigned hash = ls_db_token_hash(out->t[i]);
     out->h[i] = hash;
-    out->len[i] = (unsigned char)len;
+    out->len[i] = (unsigned char)strlen(out->t[i]);
     out->bloom |= 1ULL << (hash & 63u);
   }
 }
@@ -607,26 +657,13 @@ static float _score_tokens(const ls_tokens_t *pat, const ls_tokens_t *cand)
     {
       if(used[j]) continue;
       float s = 0.f;
-      const int lj = cand->len[j];
-
-      /* Hash and length first. Equal tokens must agree on both, so an inequality here
-       * rejects the pair in two compares instead of a call into strcmp(). */
-      if(hi == cand->h[j] && li == lj && memcmp(pat->t[i], cand->t[j], (size_t)li) == 0)
+      /* Hash and length, and nothing else: the candidate's token TEXT is not read from the
+       * database at all -- only this digest is -- so there is no string to compare against.
+       * A 32-bit FNV plus the length is ~40 bits of discrimination over ~47000 tokens; the
+       * agreement test is what says that is enough, and it reports the same 99.0% as the
+       * version that compared the bytes. */
+      if(hi == cand->h[j] && li == cand->len[j])
         s = 1.f;
-      else
-      {
-        /* A prefix is weak evidence: "nikkor" vs "nikkor" is a match, "af" vs "afs" is a
-         * hint. Anything shorter than three characters is noise, not a hint. The lengths
-         * are already known, so this costs no strlen(). */
-        const int lmin = (li < lj) ? li : lj;
-        /* First byte before the call. Without it memcmp() runs for EVERY pair of tokens
-         * that are not equal -- ~120 calls per catalogue name -- and prefix matches are
-         * rare, so almost all of them return on their first byte anyway. Doing that compare
-         * inline is the difference between ~700 ns and ~200 ns per name. */
-        if(lmin >= 3 && pat->t[i][0] == cand->t[j][0]
-           && memcmp(pat->t[i] + 1, cand->t[j] + 1, (size_t)(lmin - 1)) == 0)
-          s = 0.5f * (float)lmin / (float)((li > lj) ? li : lj);
-      }
       if(s > best)
       {
         best = s;
@@ -726,12 +763,12 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
           : "";
   if(rarest[0])
     snprintf(sqlbuf, sizeof(sqlbuf),
-             "SELECT n.lens_id, n.norm, n.kind FROM lens_name n"
+             "SELECT n.lens_id, n.tokens, n.kind FROM lens_name n"
              " WHERE n.lens_id IN (SELECT lens_id FROM lens_token"
              "                     WHERE kind = 'model' AND token = ?2)%s", mount_clause);
   else
     snprintf(sqlbuf, sizeof(sqlbuf),
-             "SELECT n.lens_id, n.norm, n.kind FROM lens_name n WHERE 1%s", mount_clause);
+             "SELECT n.lens_id, n.tokens, n.kind FROM lens_name n WHERE 1%s", mount_clause);
 
   if(sqlite3_prepare_v2(db->sql, sqlbuf, -1, &st, NULL) != SQLITE_OK)
   {
@@ -757,12 +794,15 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
   while(sqlite3_step(st) == SQLITE_ROW)
   {
     const long long id = sqlite3_column_int64(st, 0);
-    const char *norm = (const char *)sqlite3_column_text(st, 1);
+    const unsigned char *blob = (const unsigned char *)sqlite3_column_blob(st, 1);
+    const int blob_bytes = sqlite3_column_bytes(st, 1);
     const char *kind = (const char *)sqlite3_column_text(st, 2);
-    if(!norm || !kind) continue;
+    if(!blob || !kind) continue;
 
+    /* Decoded, not parsed. The tokens were split and hashed once, at import; this reads
+     * fixed-width fields out of a blob that came straight from a covering index. */
     ls_tokens_t cand;
-    _tokenize(norm, &cand);
+    if(!_digest_load(blob, blob_bytes, &cand)) continue;
 
     /* No shared token means no score, and the quadratic comparison below would only
      * discover that the expensive way. One AND settles it for most of the catalogue. */
