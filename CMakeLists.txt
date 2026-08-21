@@ -88,6 +88,26 @@ if(LENSSERIOUS_TESTS)
       set_target_properties(match_lensfun PROPERTIES C_STANDARD 11)
       add_test(NAME db_match COMMAND match_lensfun ${CMAKE_CURRENT_BINARY_DIR}/lenses.db)
 
+      # The OpenCL half of the comparison: what a correction costs to REACH a GPU, which
+      # is where this library's claim actually lives. Optional -- it needs a device.
+      find_path(OPENCL_INCLUDE_DIR CL/cl.h)
+      # libOpenCL.so.1 without a devel symlink is the normal state on a machine that has a
+      # driver but no ICD-loader -devel package, so accept the versioned name too.
+      find_library(OPENCL_LIBRARY NAMES OpenCL libOpenCL.so.1)
+      if(OPENCL_INCLUDE_DIR AND OPENCL_LIBRARY)
+        add_executable(bench_opencl tests/bench_opencl.c)
+        target_include_directories(bench_opencl PRIVATE ${OPENCL_INCLUDE_DIR})
+        target_link_libraries(bench_opencl PRIVATE lensserious_db PkgConfig::LENSFUN
+                              ${OPENCL_LIBRARY} m)
+        target_compile_options(bench_opencl PRIVATE -Wall -Wextra)
+        target_compile_definitions(bench_opencl PRIVATE
+          LS_EVAL_HEADER_PATH="${CMAKE_CURRENT_SOURCE_DIR}/include/lensserious_eval.h"
+          LS_KERNEL_PATH="${CMAKE_CURRENT_SOURCE_DIR}/opencl/lensserious.cl")
+        set_target_properties(bench_opencl PROPERTIES C_STANDARD 11)
+      else()
+        message(STATUS "OpenCL not found: the device benchmark will not be built")
+      endif()
+
       # Not a test: it measures, it does not assert. Run it by hand.
       add_executable(bench_lensfun tests/bench_lensfun.c)
       target_link_libraries(bench_lensfun PRIVATE lensserious_db PkgConfig::LENSFUN m)

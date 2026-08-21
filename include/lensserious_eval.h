@@ -127,7 +127,13 @@ typedef struct ls_eval_t
   float norm_scale;              /**< centred pixel coordinates -> calibration-normalized */
   float norm_unscale;            /**< and back */
   float center_x, center_y;      /**< optical centre, in normalized coordinates */
-  float aspect_ratio_correction; /**< vignetting works in the half-diagonal system */
+  /* Vignetting works in the half-diagonal system, i.e. the geometry coordinates divided by
+   * the aspect-ratio correction. Folded into a scale and an offset here rather than stored
+   * as the correction itself, so the per-pixel path needs one multiply and one subtract
+   * instead of a divide -- per axis, per pixel. That was three divides per pixel against
+   * lensfun's one. */
+  float vig_scale;               /**< norm_scale / aspect_ratio_correction */
+  float vig_center_x, vig_center_y; /**< centre / aspect_ratio_correction */
   float scale;                   /**< linear scaling, already reciprocal; 1.0 when off */
   int   dist_model;              /**< LS_EVAL_DIST_* */
   int   tca_model;               /**< LS_EVAL_TCA_* */
@@ -326,19 +332,19 @@ static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *ou
  * CORRECTING vignetting DIVIDES by the polynomial (ModifyColor_DeVignetting_PA applies
  * 1/c), where multiplying by c is what applies it.
  */
-static inline float ls_eval_vignette_factor(const ls_eval_t *p, float xu, float yu)
+/**
+ * @brief The vignetting multiplier for a squared radius already in the half-diagonal system.
+ *
+ * @details Split out so a row walker can hoist everything that does not vary along a row --
+ * the y term and its square -- while the polynomial itself, the pole handling and the clamp
+ * stay in ONE place for both the CPU and the kernel. Callers that have a pixel coordinate
+ * rather than a radius want ls_eval_vignette_factor().
+ */
+static inline float ls_eval_vignette_from_r2(const ls_eval_t *p, const float r2)
 {
-  if(!(p->enabled & LS_EVAL_ENABLE_VIGNETTING)) return 1.f;
-
-  const float arc = (p->aspect_ratio_correction > 0.f) ? p->aspect_ratio_correction : 1.f;
-  const float x = (xu * p->norm_scale - p->center_x) / arc;
-  const float y = (yu * p->norm_scale - p->center_y) / arc;
-
-  const float r2 = x * x + y * y;
   const float r4 = r2 * r2;
   const float c = 1.f + p->vig_terms[0] * r2 + p->vig_terms[1] * r4
                       + p->vig_terms[2] * r4 * r2;
-  if(c == 0.f) return 1.f;
 
   /* Clamped at zero, because the pa polynomial is not constrained to stay positive and for
    * some lenses it crosses zero INSIDE the frame -- the Canon EF 8-15mm Fisheye at 8mm has
@@ -349,8 +355,31 @@ static inline float ls_eval_vignette_factor(const ls_eval_t *p, float xu, float 
    * clampd(pixel * c, 0, type_max) (mod-color.cpp), so for the non-negative pixels this
    * ever sees, clamping the factor here is equivalent. Without it this returned -0.203
    * where lensfun returns 0, on every fisheye whose model has a root in frame. */
+  /* One divide and one select, and nothing else -- which is exactly what upstream does:
+   * ModifyColor_DeVignetting_PA divides by c with no special case for zero, and
+   * apply_multiplier() clamps the product at zero afterwards. An earlier version guarded
+   * c == 0 here; that guard was not upstream behaviour AND it was a second conditional,
+   * which is what stopped a caller's row loop from vectorising. Dividing by zero yields an
+   * infinity that the clamp below leaves alone for +0 and flattens for -0, matching
+   * upstream on a case that no real calibration reaches anyway.
+   *
+   * Keeping this to a single select matters more than it looks: it is the difference
+   * between one divide per pixel and one per four. */
   const float m = 1.f / c;
   return (m > 0.f) ? m : 0.f;
+}
+
+/** @brief The vignetting multiplier for ONE output pixel. Multiply the pixel by it.
+ *
+ * @details Returns 1.0 when no vignetting is resolved, so a caller may apply it
+ * unconditionally. Absolute pixel coordinates, as in ls_eval_map(). */
+static inline float ls_eval_vignette_factor(const ls_eval_t *p, float xu, float yu)
+{
+  if(!(p->enabled & LS_EVAL_ENABLE_VIGNETTING)) return 1.f;
+
+  const float x = xu * p->vig_scale - p->vig_center_x;
+  const float y = yu * p->vig_scale - p->vig_center_y;
+  return ls_eval_vignette_from_r2(p, x * x + y * y);
 }
 
 #endif /* LENSSERIOUS_EVAL_H */
