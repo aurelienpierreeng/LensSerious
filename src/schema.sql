@@ -12,7 +12,7 @@
 -- translation. That is deliberate: every conversion between the XML's vocabulary and the
 -- evaluator's happens once, offline, where it can be checked, rather than per render.
 
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
@@ -105,6 +105,30 @@ CREATE TABLE calib_vignetting (
   t0 REAL NOT NULL, t1 REAL NOT NULL, t2 REAL NOT NULL
 );
 
+-- The inverted index the fuzzy matcher prunes with. One row per (name, token).
+--
+-- It is NOT used to gather every candidate that shares any token -- that was tried and
+-- measured, and it is no better than a full scan, because the common tokens ("mm", "f",
+-- "ed", "vr", the focal digits) each appear in a large fraction of the catalogue. What the
+-- matcher does instead is ask this table which of the QUERY's tokens is rarest, and gather
+-- only the lenses carrying that one. See ls_db_match_lens().
+CREATE TABLE lens_token (
+  lens_id INTEGER NOT NULL REFERENCES lens(id),
+  kind    TEXT NOT NULL,              -- 'maker' | 'model'
+  token   TEXT NOT NULL
+);
+
+-- How many lenses each token appears in, so the matcher can find its query's rarest token
+-- with one point lookup per token instead of counting index rows. Counting is what made the
+-- first version of that lookup slow: "mm" appears in thousands of names, and COUNT(*) has
+-- to walk every one of them.
+CREATE TABLE token_df (
+  kind  TEXT NOT NULL,                -- 'maker' | 'model'
+  token TEXT NOT NULL,
+  df    INTEGER NOT NULL,
+  PRIMARY KEY (kind, token)
+) WITHOUT ROWID;
+
 -- A focal-length remap a few compacts carry, kept so nothing from upstream is lost even
 -- though the evaluators do not consult it yet.
 CREATE TABLE lens_real_focal (
@@ -116,6 +140,11 @@ CREATE TABLE lens_real_focal (
 -- Lookups are by name, and the calibration fetch is by lens_id. Nothing else is indexed:
 -- an index the reader never uses is bytes every reader pays to mmap.
 CREATE INDEX idx_lens_name_norm ON lens_name(norm);
+-- Every name of one lens, for the fuzzy matcher's second phase: without it the query that
+-- gathers the pruned candidates' names has no way in and scans the whole table, which is
+-- the scan the pruning existed to avoid.
+CREATE INDEX idx_lens_name_lens ON lens_name(lens_id);
+CREATE INDEX idx_lens_token ON lens_token(kind, token);
 CREATE INDEX idx_camera_name_norm ON camera_name(norm);
 CREATE INDEX idx_calib_distortion_lens ON calib_distortion(lens_id);
 CREATE INDEX idx_calib_tca_lens ON calib_tca(lens_id);

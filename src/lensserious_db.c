@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define LS_DB_SCHEMA_VERSION 1
+#define LS_DB_SCHEMA_VERSION 2
 
 struct ls_db_t
 {
@@ -507,9 +507,23 @@ int ls_db_meta(ls_db_t *db, const char *key, char *out, size_t out_size)
 
 enum { LS_MAX_TOKENS = 32, LS_TOKEN_LEN = 48 };
 
+/**
+ * @brief A tokenised name, with everything the comparison needs precomputed.
+ *
+ * @details The hash and the length are not an optimisation detail, they are most of the
+ * function's cost. Comparing two names is O(tokens x tokens), and doing that with strcmp()
+ * -- calling strlen() inside the inner loop, no less -- measured 610 ns per catalogue name,
+ * against 82 ns for SQLite to hand the row over. Scoring was 88% of a lookup.
+ *
+ * `bloom` is the OR of (1 << (hash % 64)) over the tokens: if two names share no bit they
+ * share no token, so the whole quadratic comparison can be skipped on one AND.
+ */
 typedef struct
 {
   char t[LS_MAX_TOKENS][LS_TOKEN_LEN];
+  unsigned h[LS_MAX_TOKENS];       /**< FNV-1a of the token */
+  unsigned char len[LS_MAX_TOKENS];
+  unsigned long long bloom;
   int n;
 } ls_tokens_t;
 
@@ -547,6 +561,21 @@ int ls_db_tokenize(const char *norm, char *out_tokens, int max, int stride)
 static void _tokenize(const char *norm, ls_tokens_t *out)
 {
   out->n = ls_db_tokenize(norm, &out->t[0][0], LS_MAX_TOKENS, LS_TOKEN_LEN);
+  out->bloom = 0;
+  for(int i = 0; i < out->n; i++)
+  {
+    unsigned hash = 2166136261u;      /* FNV-1a */
+    const char *c = out->t[i];
+    int len = 0;
+    for(; *c; c++, len++)
+    {
+      hash ^= (unsigned char)*c;
+      hash *= 16777619u;
+    }
+    out->h[i] = hash;
+    out->len[i] = (unsigned char)len;
+    out->bloom |= 1ULL << (hash & 63u);
+  }
 }
 
 /**
@@ -565,26 +594,32 @@ static float _score_tokens(const ls_tokens_t *pat, const ls_tokens_t *cand)
 {
   if(pat->n == 0 || cand->n == 0) return 0.f;
 
-  int used[LS_MAX_TOKENS] = { 0 };
+  unsigned char used[LS_MAX_TOKENS] = { 0 };
   float got = 0.f;
 
   for(int i = 0; i < pat->n; i++)
   {
+    const unsigned hi = pat->h[i];
+    const int li = pat->len[i];
     float best = 0.f;
     int best_j = -1;
     for(int j = 0; j < cand->n; j++)
     {
       if(used[j]) continue;
       float s = 0.f;
-      if(strcmp(pat->t[i], cand->t[j]) == 0)
+      const int lj = cand->len[j];
+
+      /* Hash and length first. Equal tokens must agree on both, so an inequality here
+       * rejects the pair in two compares instead of a call into strcmp(). */
+      if(hi == cand->h[j] && li == lj && memcmp(pat->t[i], cand->t[j], (size_t)li) == 0)
         s = 1.f;
       else
       {
         /* A prefix is weak evidence: "nikkor" vs "nikkor" is a match, "af" vs "afs" is a
-         * hint. Anything shorter than three characters is noise, not a hint. */
-        const size_t li = strlen(pat->t[i]), lj = strlen(cand->t[j]);
-        const size_t lmin = (li < lj) ? li : lj;
-        if(lmin >= 3 && strncmp(pat->t[i], cand->t[j], lmin) == 0)
+         * hint. Anything shorter than three characters is noise, not a hint. The lengths
+         * are already known, so this costs no strlen(). */
+        const int lmin = (li < lj) ? li : lj;
+        if(lmin >= 3 && memcmp(pat->t[i], cand->t[j], (size_t)lmin) == 0)
           s = 0.5f * (float)lmin / (float)((li > lj) ? li : lj);
       }
       if(s > best)
@@ -624,35 +659,81 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
   _tokenize(nmaker, &pat_maker);
   if(pat.n == 0) return 0;
 
-  /* One scan over the name table, scored in C. ~4700 rows, and the scoring is where the
-   * time goes rather than the SQL: measured 2.97 ms per lookup against lensfun's 0.027 ms,
-   * because lensfun is comparing structs already in RAM and this is walking a b-tree.
+  /* Two phases, and the first one is what makes this cheap.
    *
-   * An inverted token index was built and MEASURED, and it is not here because it made
-   * things worse: 5.13 ms, for identical agreement. Model tokens are not selective --
-   * "mm", "f", "ed", "vr" and the focal digits each match a large fraction of the
-   * catalogue -- so the candidate set stayed near the full table and the subquery was pure
-   * added cost. The schema is simpler for its absence.
+   * Scoring every name in the catalogue costs 610 ns each -- 88% of a lookup, measured --
+   * and there are ~4700 of them. The fix is not to score faster (hashing the tokens first
+   * was tried and moved nothing: the per-comparison cost was already ~5 ns, there were
+   * simply half a million comparisons). The fix is to score far fewer names.
    *
-   * 3 ms is once per image, against 272 ms to build that image's map and the 88 ms of XML
-   * parsing this design removes outright. It is not the bottleneck; it is only the one
-   * place a database loses to an in-memory search, and worth stating plainly.
+   * So: ask lens_token which of the QUERY's tokens is rarest, and gather only the lenses
+   * carrying it. "16" or "nikkor" reaches tens of lenses where "mm" or "f" reaches
+   * thousands, which is exactly why gathering on ALL the query's tokens -- also tried, also
+   * measured -- is no better than the full scan it replaces.
    *
-   * The scoring stays in C rather than in SQL expressions, which could not be read or
-   * unit-tested. The mount filter is pushed into SQL because that one IS selective. */
+   * The frequencies come from token_df, precomputed at import. Deriving them here with a
+   * GROUP BY over lens_token was the first attempt and cost 0.6 ms on its own: counting how
+   * often "mm" occurs means walking every one of its index rows.
+   *
+   * If that yields nothing (a query whose rarest token no catalogue name shares), the scan
+   * runs after all, so the answer never depends on the pruning. */
+  char in_list[LS_MAX_TOKENS * (LS_TOKEN_LEN + 4) + 8];
+  {
+    size_t w = 0;
+    in_list[w++] = '(';
+    for(int i = 0; i < pat.n; i++)
+    {
+      if(i) in_list[w++] = ',';
+      in_list[w++] = '\'';
+      for(const char *c = pat.t[i]; *c; c++)
+        if(*c != '\'') in_list[w++] = *c;   /* tokens are [a-z0-9] after normalisation */
+      in_list[w++] = '\'';
+    }
+    in_list[w++] = ')';
+    in_list[w] = '\0';
+  }
+
+  char rarest[LS_TOKEN_LEN] = { 0 };
+  {
+    char sqlbuf[sizeof(in_list) + 256];
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT token FROM token_df WHERE kind = 'model' AND token IN %s"
+             " ORDER BY df ASC LIMIT 1", in_list);
+    sqlite3_stmt *rq = NULL;
+    if(sqlite3_prepare_v2(db->sql, sqlbuf, -1, &rq, NULL) == SQLITE_OK)
+    {
+      if(sqlite3_step(rq) == SQLITE_ROW)
+      {
+        const char *t = (const char *)sqlite3_column_text(rq, 0);
+        if(t) snprintf(rarest, sizeof(rarest), "%s", t);
+      }
+      sqlite3_finalize(rq);
+    }
+  }
+
   sqlite3_stmt *st = NULL;
-  const char *sql =
+  char sqlbuf[1024];
+  const char *mount_clause =
       (mount_id > 0)
-          ? "SELECT n.lens_id, n.norm, n.kind FROM lens_name n"
-            " WHERE EXISTS (SELECT 1 FROM lens_mount lm WHERE lm.lens_id = n.lens_id AND ("
+          ? " AND EXISTS (SELECT 1 FROM lens_mount lm WHERE lm.lens_id = n.lens_id AND ("
             "   lm.mount_id = ?1 OR EXISTS (SELECT 1 FROM mount_compat mc"
             "     WHERE mc.mount_id = ?1 AND mc.compat_id = lm.mount_id)))"
-          : "SELECT n.lens_id, n.norm, n.kind FROM lens_name n";
-  if(sqlite3_prepare_v2(db->sql, sql, -1, &st, NULL) != SQLITE_OK)
+          : "";
+  if(rarest[0])
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT n.lens_id, n.norm, n.kind FROM lens_name n"
+             " WHERE n.lens_id IN (SELECT lens_id FROM lens_token"
+             "                     WHERE kind = 'model' AND token = ?2)%s", mount_clause);
+  else
+    snprintf(sqlbuf, sizeof(sqlbuf),
+             "SELECT n.lens_id, n.norm, n.kind FROM lens_name n WHERE 1%s", mount_clause);
+
+  if(sqlite3_prepare_v2(db->sql, sqlbuf, -1, &st, NULL) != SQLITE_OK)
   {
     _db_err(db, "prepare match");
     return -1;
   }
+  if(rarest[0]) sqlite3_bind_text(st, 2, rarest, -1, SQLITE_STATIC);
   if(mount_id > 0) sqlite3_bind_int64(st, 1, mount_id);
 
   /* Best score per lens, kept in a small open-addressed table: a lens has several names
@@ -677,6 +758,11 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
 
     ls_tokens_t cand;
     _tokenize(norm, &cand);
+
+    /* No shared token means no score, and the quadratic comparison below would only
+     * discover that the expensive way. One AND settles it for most of the catalogue. */
+    if(!(cand.bloom & ((kind[0] == 'm' && kind[1] == 'o') ? pat.bloom : pat_maker.bloom)))
+      continue;
 
     size_t slot = (size_t)id % SLOTS;
     while(ids[slot] && ids[slot] != id) slot = (slot + 1) % SLOTS;

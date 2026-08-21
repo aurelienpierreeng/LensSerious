@@ -116,6 +116,7 @@ typedef struct
 {
   sqlite3 *db;
   sqlite3_stmt *st;
+  sqlite3_stmt *tok;      /* NULL for cameras: only lenses are fuzzy-matched */
   long long owner_id;
   const char *kind;
 } name_ctx_t;
@@ -135,6 +136,20 @@ static void insert_name(const char *lang, const char *value, void *ud)
   sqlite3_bind_text(c->st, 4, value, -1, SQLITE_TRANSIENT);
   sqlite3_bind_text(c->st, 5, norm, -1, SQLITE_TRANSIENT);
   step_reset(c->db, c->st);
+
+  if(!c->tok) return;
+  /* Index this name's tokens, so a lookup can ask which of ITS tokens is rarest instead of
+   * scoring the whole catalogue. Tokenised here, offline, by the same function the matcher
+   * uses on the query. */
+  char tokens[32][48];
+  const int n = ls_db_tokenize(norm, &tokens[0][0], 32, 48);
+  for(int i = 0; i < n; i++)
+  {
+    sqlite3_bind_int64(c->tok, 1, c->owner_id);
+    sqlite3_bind_text(c->tok, 2, c->kind, -1, SQLITE_STATIC);
+    sqlite3_bind_text(c->tok, 3, tokens[i], -1, SQLITE_TRANSIENT);
+    step_reset(c->db, c->tok);
+  }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -297,6 +312,8 @@ int main(int argc, char **argv)
                                     " VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)");
   sqlite3_stmt *ins_lens_name = prep(db, "INSERT INTO lens_name(lens_id, kind, lang, value, norm)"
                                          " VALUES (?1, ?2, ?3, ?4, ?5)");
+  sqlite3_stmt *ins_token = prep(db, "INSERT INTO lens_token(lens_id, kind, token)"
+                                     " VALUES (?1, ?2, ?3)");
   sqlite3_stmt *ins_lens_mount = prep(db, "INSERT OR IGNORE INTO lens_mount(lens_id, mount_id) VALUES (?1, ?2)");
   sqlite3_stmt *ins_dist = prep(db, "INSERT INTO calib_distortion(lens_id, model, focal, t0, t1, t2)"
                                     " VALUES (?1,?2,?3,?4,?5,?6)");
@@ -339,7 +356,7 @@ int main(int argc, char **argv)
     step_reset(db, ins_cam);
 
     const long long id = sqlite3_last_insert_rowid(db);
-    name_ctx_t ctx = { db, ins_cam_name, id, "maker" };
+    name_ctx_t ctx = { db, ins_cam_name, NULL, id, "maker" };
     for_each_mlstr(cam->Maker, insert_name, &ctx);
     ctx.kind = "model";
     for_each_mlstr(cam->Model, insert_name, &ctx);
@@ -365,7 +382,7 @@ int main(int argc, char **argv)
 
     const long long id = sqlite3_last_insert_rowid(db);
 
-    name_ctx_t ctx = { db, ins_lens_name, id, "maker" };
+    name_ctx_t ctx = { db, ins_lens_name, ins_token, id, "maker" };
     for_each_mlstr(lens->Maker, insert_name, &ctx);
     ctx.kind = "model";
     for_each_mlstr(lens->Model, insert_name, &ctx);
@@ -438,6 +455,12 @@ int main(int argc, char **argv)
     }
   }
 
+  /* Derive the token frequencies from what was just inserted, rather than counting in C:
+   * one statement, and it cannot disagree with the table it summarises. */
+  exec_or_die(db, "INSERT INTO token_df(kind, token, df)"
+                  " SELECT kind, token, COUNT(DISTINCT lens_id) FROM lens_token"
+                  " GROUP BY kind, token");
+
   exec_or_die(db, "COMMIT");
   exec_or_die(db, "ANALYZE");
   /* One contiguous file with no free pages: it is never written again, and every reader
@@ -452,6 +475,7 @@ int main(int argc, char **argv)
   sqlite3_finalize(ins_cam_name);
   sqlite3_finalize(ins_lens);
   sqlite3_finalize(ins_lens_name);
+  sqlite3_finalize(ins_token);
   sqlite3_finalize(ins_lens_mount);
   sqlite3_finalize(ins_dist);
   sqlite3_finalize(ins_tca);
