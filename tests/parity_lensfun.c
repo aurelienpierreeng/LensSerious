@@ -34,6 +34,8 @@ static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
     default:             out->type = LS_LENS_FISHEYE; break; /* any non-rectilinear: skip */
   }
   out->crop_factor = lf->CropFactor;
+  out->min_focal = lf->MinFocal;
+  out->max_focal = lf->MaxFocal;
   out->aspect_ratio = lf->AspectRatio;
   out->center_x = lf->CenterX;
   out->center_y = lf->CenterY;
@@ -85,11 +87,15 @@ static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
 
 int main(int argc, char **argv)
 {
-  const float crop = (argc > 1) ? atof(argv[1]) : 1.53f; /* APS-C, the common case */
+  /* Shooting crop: each lens is exercised on ITS OWN calibration sensor and on a 10%
+   * larger crop. A fixed global crop compares compacts (crop 4.6+) at APS-C, i.e.
+   * evaluates the polynomials far outside the calibrated field -- the first run of this
+   * harness did exactly that and produced 256 px "deltas" that were configuration
+   * nonsense, not model divergence. */
+  const float crop_ratios[2] = { 1.0f, 1.1f };
+  (void)argc; (void)argv;
   const int W = 1024, H = 683;
 
-  lfDatabase *db = new_lfDatabase ? NULL : NULL; /* placate -Wunused on odd SDKs */
-  (void)db;
   lfDatabase *ldb = lf_db_new();
   if(lf_db_load(ldb) != LF_NO_ERROR)
   {
@@ -126,8 +132,10 @@ int main(int argc, char **argv)
     if(lens.n_dist == 0) { fmin = fmax = 50.f; }
     const float focals[3] = { fmin, 0.5f * (fmin + fmax), fmax };
 
+    for(int ci = 0; ci < 2; ci++)
     for(int fi = 0; fi < 3; fi++)
     {
+      const float crop = lf->CropFactor * crop_ratios[ci];
       const float focal = focals[fi];
 
       lfModifier *ref = lf_modifier_new(lf, crop, W, H);
@@ -158,7 +166,13 @@ int main(int argc, char **argv)
                 worst_px = d;
                 snprintf(worst_name, sizeof(worst_name), "%s @ %.1fmm term %d", lf->Model, focal, k);
               }
-              if(d > TOL_GEOMETRY_PX) failed++;
+              if(d > TOL_GEOMETRY_PX)
+              {
+                if(failed < 3)
+                  printf("GEOFAIL %s crop=%.2f focal=%.1f xy=(%.0f,%.0f) k=%d  lf=%.4f ls=%.4f\n",
+                         lf->Model, crop, focal, xs[xi], ys[yi], k, a[k], b[k]);
+                failed++;
+              }
             }
           }
       }
@@ -189,7 +203,13 @@ int main(int argc, char **argv)
               worst_vig = d;
               snprintf(worst_vig_name, sizeof(worst_vig_name), "%s @ %.1fmm", lf->Model, focal);
             }
-            if(d > TOL_VIGNETTING) vig_failed++;
+            if(d > TOL_VIGNETTING)
+            {
+              if(vig_failed < 3)
+                printf("VIGFAIL %s crop=%.2f focal=%.1f x=%.0f k=%d  lf=%.6f ls=%.6f  (lfmods=%d lsmods=%d)\n",
+                       lf->Model, crop, focal, xs[xi], k, rowa[k], rowb[k], vrefmods, vmymods);
+              vig_failed++;
+            }
           }
         }
       }
@@ -197,7 +217,7 @@ int main(int argc, char **argv)
       lf_modifier_destroy(ref);
     }
   }
-  lf_free(lenses);
+  /* GetLenses() returns the database-owned array: not ours to free. */
   lf_db_destroy(ldb);
 
   printf("parity: %d lenses total, %d geometry-compared, %d skipped (projection not yet"

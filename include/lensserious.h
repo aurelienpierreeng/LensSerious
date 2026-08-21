@@ -81,7 +81,7 @@ typedef struct ls_calib_dist_t { ls_dist_model_t model; float focal; float terms
 typedef struct ls_calib_tca_t  { ls_tca_model_t  model; float focal; float terms[6]; } ls_calib_tca_t;
 typedef struct ls_calib_vig_t  { ls_vig_model_t  model; float focal, aperture, distance; float terms[3]; } ls_calib_vig_t;
 
-enum { LS_MAX_CALIB = 32 };
+enum { LS_MAX_CALIB = 512 }; /* the densest lens in the 2026 database has ~300 vignetting points */
 
 typedef enum ls_lens_type_t
 {
@@ -102,6 +102,7 @@ typedef struct ls_lens_t
   ls_lens_type_t type;
   float crop_factor;   /**< of the CALIBRATION sensor: coefficient rescaling depends on it */
   float aspect_ratio;  /**< of the calibration sensor, e.g. 1.5 */
+  float min_focal, max_focal; /**< the lens's whole range: the vignetting metric needs it */
   float center_x, center_y; /**< optical centre shift, lensfun convention (fraction of size) */
   int n_dist; ls_calib_dist_t dist[LS_MAX_CALIB];
   int n_tca;  ls_calib_tca_t  tca[LS_MAX_CALIB];
@@ -126,6 +127,7 @@ typedef struct ls_modifier_t
    * norm_scale converts centred pixel coordinates to the calibration sensor's
    * normalized system; centre includes the lens's optical-centre shift. */
   float norm_scale, norm_unscale;
+  float aspect_ratio_correction; /* vignetting works in the half-diagonal system */
   float center_x, center_y;   /* in normalized coordinates */
   float width, height;        /* the (dimension − 1) values, lensfun's own convention */
 

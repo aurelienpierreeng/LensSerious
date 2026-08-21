@@ -96,9 +96,14 @@ static int _interp_dist(const ls_lens_t *lens, float focal, ls_calib_dist_t *res
   const float t = (focal - lo->focal) / (hi->focal - lo->focal);
   const ls_calib_dist_t *fl = (const ls_calib_dist_t *)s.v[0];
   const ls_calib_dist_t *fh = (const ls_calib_dist_t *)s.v[3];
+  /* Upstream __parameter_scales (lens.cpp:841) leaves the FOCALS in for every distortion
+   * model: coefficients are interpolated in the term×focal domain, then divided by the
+   * target focal. The first harness run against the raw-coefficient version measured up
+   * to 4.9 px of divergence at interpolated focals -- this scaling is load-bearing. */
   for(int i = 0; i < 3; i++)
-    res->terms[i] = _interpolate(fl ? fl->terms[i] : FLT_MAX, lo->terms[i], hi->terms[i],
-                                 fh ? fh->terms[i] : FLT_MAX, t);
+    res->terms[i] = _interpolate(fl ? fl->terms[i] * fl->focal : FLT_MAX,
+                                 lo->terms[i] * lo->focal, hi->terms[i] * hi->focal,
+                                 fh ? fh->terms[i] * fh->focal : FLT_MAX, t) / focal;
   return 1;
 }
 
@@ -131,27 +136,51 @@ static int _interp_tca(const ls_lens_t *lens, float focal, ls_calib_tca_t *res)
   const float t = (focal - lo->focal) / (hi->focal - lo->focal);
   const ls_calib_tca_t *fl = (const ls_calib_tca_t *)s.v[0];
   const ls_calib_tca_t *fh = (const ls_calib_tca_t *)s.v[3];
+  /* Same term×focal domain as distortion, EXCEPT terms 0..1 (vr/vb, kr/kb), which
+   * __parameter_scales exempts by setting the scales to 1.0. */
   for(int i = 0; i < 6; i++)
-    res->terms[i] = _interpolate(fl ? fl->terms[i] : FLT_MAX, lo->terms[i], hi->terms[i],
-                                 fh ? fh->terms[i] : FLT_MAX, t);
+  {
+    const float sl0 = (i < 2) ? 1.f : (fl ? fl->focal : 1.f);
+    const float sl1 = (i < 2) ? 1.f : lo->focal;
+    const float sl2 = (i < 2) ? 1.f : hi->focal;
+    const float sl3 = (i < 2) ? 1.f : (fh ? fh->focal : 1.f);
+    const float sl4 = (i < 2) ? 1.f : focal;
+    res->terms[i] = _interpolate(fl ? fl->terms[i] * sl0 : FLT_MAX,
+                                 lo->terms[i] * sl1, hi->terms[i] * sl2,
+                                 fh ? fh->terms[i] * sl3 : FLT_MAX, t) / sl4;
+  }
   return 1;
 }
 
-/* Vignetting interpolates over (focal, aperture, distance). Upstream
- * (lens.cpp:InterpolateVignetting, 0.3.4) uses inverse-distance weighting in a scaled
- * 3-space over ALL calibration points — ported here with the same weights: the metric
- * is (Δfocal/focal)² + (Δaperture/aperture)² + 0.1·(Δlog(distance))², nearest-wins on
- * an exact hit. THE ONE PLACE this seed simplifies upstream: 0.3.4 weights log-distance
- * pairs through its own ratio scheme; the harness flags any lens where this drifts
- * beyond tolerance, and tests/parity_lensfun.c reports it separately so the refinement
- * is measurable, not assumed. */
+/* Vignetting — verbatim port of lfLens::InterpolateVignetting() and __vignetting_dist()
+ * (lens.cpp): inverse-distance weighting with p = 3.5 over ALL calibration points, in a
+ * space where focal is normalized by the lens's whole range, aperture enters as 4/A and
+ * distance as 0.1/D. An exact hit (< 1e-4) short-circuits; a nearest point further than
+ * 1.0 rejects the whole interpolation. The first version of this file used an ad-hoc
+ * metric here; the harness measured multiplier deltas up to 3.65 against upstream and
+ * this port is what removed them. */
+static float _vig_dist(const ls_lens_t *lens, const ls_calib_vig_t *c,
+                       float focal, float aperture, float distance)
+{
+  float f1 = focal - lens->min_focal;
+  float f2 = c->focal - lens->min_focal;
+  const float df = lens->max_focal - lens->min_focal;
+  if(df != 0.f) { f1 /= df; f2 /= df; }
+  const float a1 = 4.f / aperture;
+  const float a2 = 4.f / c->aperture;
+  const float d1 = 0.1f / distance;
+  const float d2 = 0.1f / c->distance;
+  return sqrtf((f2 - f1) * (f2 - f1) + (a2 - a1) * (a2 - a1) + (d2 - d1) * (d2 - d1));
+}
+
 static int _interp_vig(const ls_lens_t *lens, float focal, float aperture, float distance,
                        ls_calib_vig_t *res)
 {
   if(lens->n_vig == 0) return 0;
-  if(distance <= 0.f) distance = 1000.f;
-  float wsum = 0.f, terms[3] = { 0.f, 0.f, 0.f };
   ls_vig_model_t model = LS_VIG_NONE;
+  float total_weighting = 0.f;
+  float smallest = FLT_MAX;
+  float terms[3] = { 0.f, 0.f, 0.f };
 
   for(int i = 0; i < lens->n_vig; i++)
   {
@@ -159,20 +188,23 @@ static int _interp_vig(const ls_lens_t *lens, float focal, float aperture, float
     if(c->model == LS_VIG_NONE) continue;
     if(model == LS_VIG_NONE) model = c->model;
     else if(model != c->model) continue;
-    const float df = (focal - c->focal) / (c->focal > 0.f ? c->focal : 1.f);
-    const float da = (aperture - c->aperture) / (c->aperture > 0.f ? c->aperture : 1.f);
-    const float cd = c->distance > 0.f ? c->distance : 1000.f;
-    const float dd = logf(distance / cd);
-    const float d2 = df * df + da * da + 0.1f * dd * dd;
-    if(d2 < 1e-12f) { *res = *c; return 1; }
-    const float w = 1.f / d2;
+
+    const float dist = _vig_dist(lens, c, focal, aperture, distance);
+    if(dist < 0.0001f) { *res = *c; return 1; }
+    if(dist < smallest) smallest = dist;
+    /* Upstream computes the weight in DOUBLE (fabs(1.0 / pow(dist, 3.5))) and only then
+     * truncates: near an exact hit d^3.5 ~ 1e-14 and the two arithmetics disagree enough
+     * to change the mixture -- the harness measured 0.77 of multiplier drift for it. */
+    const float w = (float)fabs(1.0 / pow((double)dist, 3.5));
     for(int k = 0; k < 3; k++) terms[k] += w * c->terms[k];
-    wsum += w;
+    total_weighting += w;
   }
-  if(model == LS_VIG_NONE || wsum <= 0.f) return 0;
+  if(smallest > 1.f) return 0;
+  if(total_weighting <= 0.f || smallest == FLT_MAX) return 0;
+
   res->model = model;
   res->focal = focal; res->aperture = aperture; res->distance = distance;
-  for(int k = 0; k < 3; k++) res->terms[k] = terms[k] / wsum;
+  for(int k = 0; k < 3; k++) res->terms[k] = terms[k] / total_weighting;
   return 1;
 }
 
@@ -207,6 +239,7 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
 
   mod->norm_scale = 2.f / size * coordinate_correction;
   mod->norm_unscale = size * 0.5f / coordinate_correction;
+  mod->aspect_ratio_correction = aspect_ratio_correction;
   mod->center_x = (w / size + lens->center_x) * coordinate_correction;
   mod->center_y = (h / size + lens->center_y) * coordinate_correction;
 
@@ -343,19 +376,30 @@ int ls_modifier_apply_vignetting(const ls_modifier_t *mod,
   const size_t stride = row_stride_bytes ? (size_t)row_stride_bytes / sizeof(float)
                                          : (size_t)width * 4;
 
+  /* "Damn! Hugin uses two different 'normalized' coordinate systems: for distortions it
+   * uses 1.0 = min(half width, half height) and for vignetting it uses 1.0 = half
+   * diagonal length." (mod-color.cpp) -- so this radius is the geometry one divided by
+   * the aspect-ratio correction. And CORRECTION divides: ModifyColor_DeVignetting_PA
+   * applies 1/c; multiplying by c is what APPLIES vignetting. The first harness run got
+   * both of these wrong and measured multiplier deltas up to 37.9 for it. */
+  const float arc = (mod->aspect_ratio_correction > 0.f) ? mod->aspect_ratio_correction : 1.f;
+
   for(int row = 0; row < height; row++)
   {
     float *px = rgba + (size_t)row * stride;
-    const float y = (yu + row) * mod->norm_scale - mod->center_y;
-    /* mod-color.cpp walks r² incrementally; the closed form per pixel is identical
-     * in exact arithmetic and steadier in float, and the harness compares outputs. */
+    const float y = ((yu + row) * mod->norm_scale - mod->center_y) / arc;
     for(int col = 0; col < width; col++, px += 4)
     {
-      const float x = (xu + col) * mod->norm_scale - mod->center_x;
+      const float x = ((xu + col) * mod->norm_scale - mod->center_x) / arc;
       const float r2 = x * x + y * y;
       const float r4 = r2 * r2;
       const float c = 1.f + k1 * r2 + k2 * r4 + k3 * r4 * r2;
-      px[0] *= c; px[1] *= c; px[2] *= c;
+      const float inv = (c != 0.f) ? 1.f / c : 1.f;
+      /* All FOUR components, alpha included: upstream's apply_multiplier under
+       * LF_CR_4(RED,GREEN,BLUE,UNKNOWN) multiplies the UNKNOWN channel too, and the
+       * harness caught the difference on literally every sampled pixel (k=3,7,11...).
+       * Whether that is wise is not this library's question; parity is. */
+      px[0] *= inv; px[1] *= inv; px[2] *= inv; px[3] *= inv;
     }
   }
   return 1;
