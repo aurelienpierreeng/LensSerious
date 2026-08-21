@@ -81,29 +81,57 @@ CREATE TABLE camera_name (
 );
 
 -- Terms are packed exactly as ls_calib_dist_t/ls_calib_tca_t/ls_calib_vig_t declare them.
+--
+-- WITHOUT ROWID, keyed on (lens_id, ord). The table IS its primary-key b-tree, so one
+-- lens's calibration is physically contiguous and reading it never leaves that b-tree --
+-- where a plain table plus an index on lens_id costs a separate table seek for every row
+-- the index finds.
+--
+-- `ord` is the position within the lens as upstream listed it, and it turns a convention
+-- into a guarantee: the reader fills ls_lens_t's arrays in row order, which under a rowid
+-- table was insertion order only by habit, and is now the key order the storage engine
+-- promises.
+--
+-- Measured on a 70-row fetch, all three against the same surrounding schema:
+--   WITHOUT ROWID (lens_id, ord)     0.0385 ms   3.76 MB   <- this
+--   plain table + index(lens_id)     0.0436 ms   4.19 MB
+--   plain table + index(lens_id,ord) 0.0474 ms   4.35 MB   -- the column AND a wider index
+-- Faster and smaller: such a table repeats its key in every row, but dropping the three
+-- lens_id indexes more than pays for that. An earlier round rejected this form on size,
+-- having compared it against a baseline taken before lens_token and token_df existed --
+-- which is what a comparison between two different schemas is worth.
 CREATE TABLE calib_distortion (
   lens_id INTEGER NOT NULL REFERENCES lens(id),
+  ord     INTEGER NOT NULL,           -- position within this lens, as upstream listed it
   model   INTEGER NOT NULL,           -- ls_dist_model_t
   focal   REAL NOT NULL,
   t0 REAL NOT NULL, t1 REAL NOT NULL, t2 REAL NOT NULL
-);
+,
+  PRIMARY KEY (lens_id, ord)
+) WITHOUT ROWID;
 
 CREATE TABLE calib_tca (
   lens_id INTEGER NOT NULL REFERENCES lens(id),
+  ord     INTEGER NOT NULL,           -- position within this lens, as upstream listed it
   model   INTEGER NOT NULL,           -- ls_tca_model_t
   focal   REAL NOT NULL,
   t0 REAL NOT NULL, t1 REAL NOT NULL, t2 REAL NOT NULL,
   t3 REAL NOT NULL, t4 REAL NOT NULL, t5 REAL NOT NULL
-);
+,
+  PRIMARY KEY (lens_id, ord)
+) WITHOUT ROWID;
 
 CREATE TABLE calib_vignetting (
   lens_id  INTEGER NOT NULL REFERENCES lens(id),
+  ord      INTEGER NOT NULL,          -- position within this lens, as upstream listed it
   model    INTEGER NOT NULL,          -- ls_vig_model_t
   focal    REAL NOT NULL,
   aperture REAL NOT NULL,
   distance REAL NOT NULL,
   t0 REAL NOT NULL, t1 REAL NOT NULL, t2 REAL NOT NULL
-);
+,
+  PRIMARY KEY (lens_id, ord)
+) WITHOUT ROWID;
 
 -- The inverted index the fuzzy matcher prunes with. One row per (name, token).
 --
@@ -143,10 +171,14 @@ CREATE INDEX idx_lens_name_norm ON lens_name(norm);
 -- Every name of one lens, for the fuzzy matcher's second phase: without it the query that
 -- gathers the pruned candidates' names has no way in and scans the whole table, which is
 -- the scan the pruning existed to avoid.
-CREATE INDEX idx_lens_name_lens ON lens_name(lens_id);
-CREATE INDEX idx_lens_token ON lens_token(kind, token);
+--
+-- COVERING: kind and norm are in the index, not just lens_id, so the search never touches
+-- the table. An index that only carries the search key still costs one table seek per row
+-- found, which is what `SEARCH ... USING INDEX` hides -- the row it lands on is an index
+-- entry, and every column outside the index is another b-tree descent.
+CREATE INDEX idx_lens_name_lens ON lens_name(lens_id, kind, norm);
+-- COVERING for the same reason: the pruning subquery wants lens_id, so carrying it in the
+-- index means the token lookup never descends into lens_token itself.
+CREATE INDEX idx_lens_token ON lens_token(kind, token, lens_id);
 CREATE INDEX idx_camera_name_norm ON camera_name(norm);
-CREATE INDEX idx_calib_distortion_lens ON calib_distortion(lens_id);
-CREATE INDEX idx_calib_tca_lens ON calib_tca(lens_id);
-CREATE INDEX idx_calib_vignetting_lens ON calib_vignetting(lens_id);
 CREATE INDEX idx_lens_mount_mount ON lens_mount(mount_id);

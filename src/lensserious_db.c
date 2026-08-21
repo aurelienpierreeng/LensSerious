@@ -193,9 +193,9 @@ static int _fill_calibrations(ls_db_t *db, long long lens_id, ls_lens_t *out)
     const char *sql;
     int terms;
   } q[3] = {
-    { "SELECT model, focal, t0, t1, t2 FROM calib_distortion WHERE lens_id = ?1", 3 },
-    { "SELECT model, focal, t0, t1, t2, t3, t4, t5 FROM calib_tca WHERE lens_id = ?1", 6 },
-    { "SELECT model, focal, aperture, distance, t0, t1, t2 FROM calib_vignetting WHERE lens_id = ?1", 3 },
+    { "SELECT model, focal, t0, t1, t2 FROM calib_distortion WHERE lens_id = ?1 ORDER BY ord", 3 },
+    { "SELECT model, focal, t0, t1, t2, t3, t4, t5 FROM calib_tca WHERE lens_id = ?1 ORDER BY ord", 6 },
+    { "SELECT model, focal, aperture, distance, t0, t1, t2 FROM calib_vignetting WHERE lens_id = ?1 ORDER BY ord", 3 },
   };
 
   for(int kind = 0; kind < 3; kind++)

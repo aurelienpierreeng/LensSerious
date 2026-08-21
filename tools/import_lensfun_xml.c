@@ -315,12 +315,12 @@ int main(int argc, char **argv)
   sqlite3_stmt *ins_token = prep(db, "INSERT INTO lens_token(lens_id, kind, token)"
                                      " VALUES (?1, ?2, ?3)");
   sqlite3_stmt *ins_lens_mount = prep(db, "INSERT OR IGNORE INTO lens_mount(lens_id, mount_id) VALUES (?1, ?2)");
-  sqlite3_stmt *ins_dist = prep(db, "INSERT INTO calib_distortion(lens_id, model, focal, t0, t1, t2)"
-                                    " VALUES (?1,?2,?3,?4,?5,?6)");
-  sqlite3_stmt *ins_tca = prep(db, "INSERT INTO calib_tca(lens_id, model, focal, t0,t1,t2,t3,t4,t5)"
-                                   " VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)");
-  sqlite3_stmt *ins_vig = prep(db, "INSERT INTO calib_vignetting(lens_id, model, focal, aperture,"
-                                   " distance, t0, t1, t2) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)");
+  sqlite3_stmt *ins_dist = prep(db, "INSERT INTO calib_distortion(lens_id, ord, model, focal, t0, t1, t2)"
+                                    " VALUES (?1,?2,?3,?4,?5,?6,?7)");
+  sqlite3_stmt *ins_tca = prep(db, "INSERT INTO calib_tca(lens_id, ord, model, focal, t0,t1,t2,t3,t4,t5)"
+                                   " VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
+  sqlite3_stmt *ins_vig = prep(db, "INSERT INTO calib_vignetting(lens_id, ord, model, focal, aperture,"
+                                   " distance, t0, t1, t2) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)");
 
   /* mounts, then their compatibility lists (which reference mounts by name) */
   int n_mounts = 0;
@@ -401,9 +401,10 @@ int main(int argc, char **argv)
       for(lfLensCalibDistortion **c = lens->CalibDistortion; *c; c++, n_dist++)
       {
         sqlite3_bind_int64(ins_dist, 1, id);
-        sqlite3_bind_int(ins_dist, 2, dist_model((*c)->Model));
-        sqlite3_bind_double(ins_dist, 3, (*c)->Focal);
-        for(int t = 0; t < 3; t++) sqlite3_bind_double(ins_dist, 4 + t, (*c)->Terms[t]);
+        sqlite3_bind_int(ins_dist, 2, (int)(c - lens->CalibDistortion));
+        sqlite3_bind_int(ins_dist, 3, dist_model((*c)->Model));
+        sqlite3_bind_double(ins_dist, 4, (*c)->Focal);
+        for(int t = 0; t < 3; t++) sqlite3_bind_double(ins_dist, 5 + t, (*c)->Terms[t]);
         step_reset(db, ins_dist);
       }
 
@@ -411,9 +412,10 @@ int main(int argc, char **argv)
       for(lfLensCalibTCA **c = lens->CalibTCA; *c; c++, n_tca++)
       {
         sqlite3_bind_int64(ins_tca, 1, id);
-        sqlite3_bind_int(ins_tca, 2, tca_model((*c)->Model));
-        sqlite3_bind_double(ins_tca, 3, (*c)->Focal);
-        for(int t = 0; t < 6; t++) sqlite3_bind_double(ins_tca, 4 + t, (*c)->Terms[t]);
+        sqlite3_bind_int(ins_tca, 2, (int)(c - lens->CalibTCA));
+        sqlite3_bind_int(ins_tca, 3, tca_model((*c)->Model));
+        sqlite3_bind_double(ins_tca, 4, (*c)->Focal);
+        for(int t = 0; t < 6; t++) sqlite3_bind_double(ins_tca, 5 + t, (*c)->Terms[t]);
         step_reset(db, ins_tca);
       }
 
@@ -421,11 +423,12 @@ int main(int argc, char **argv)
       for(lfLensCalibVignetting **c = lens->CalibVignetting; *c; c++, n_vig++)
       {
         sqlite3_bind_int64(ins_vig, 1, id);
-        sqlite3_bind_int(ins_vig, 2, LS_VIG_PA);
-        sqlite3_bind_double(ins_vig, 3, (*c)->Focal);
-        sqlite3_bind_double(ins_vig, 4, (*c)->Aperture);
-        sqlite3_bind_double(ins_vig, 5, (*c)->Distance);
-        for(int t = 0; t < 3; t++) sqlite3_bind_double(ins_vig, 6 + t, (*c)->Terms[t]);
+        sqlite3_bind_int(ins_vig, 2, (int)(c - lens->CalibVignetting));
+        sqlite3_bind_int(ins_vig, 3, LS_VIG_PA);
+        sqlite3_bind_double(ins_vig, 4, (*c)->Focal);
+        sqlite3_bind_double(ins_vig, 5, (*c)->Aperture);
+        sqlite3_bind_double(ins_vig, 6, (*c)->Distance);
+        for(int t = 0; t < 3; t++) sqlite3_bind_double(ins_vig, 7 + t, (*c)->Terms[t]);
         step_reset(db, ins_vig);
       }
   }
