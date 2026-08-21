@@ -37,9 +37,22 @@ jobs:
       # comparison, the fuzzy-match oracle, and the offline OpenCL compilation. The
       # database tests rebuild lenses.db from the system XML first, so this also covers
       # the importer.
+      # -V because a passing ctest prints nothing, and the parity harness's summary is
+      # worth reading on a GREEN run: it reports how far liblensfun's own row walk sits
+      # from its own scalar answer on this runner. That figure is upstream's SSE
+      # approximation, it differs per distribution build, and it is the reason the row
+      # assertions are made against the width-1 answer instead.
       - name: Test
         working-directory: build
-        run: ctest --output-on-failure
+        run: |
+          set -o pipefail
+          ctest --output-on-failure -V 2>&1 | tee ctest.log
+          {
+            echo "### Parity"
+            echo '```'
+            grep -a '^parity:' ctest.log || echo "(no parity summary in the log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Benchmark
         working-directory: build
