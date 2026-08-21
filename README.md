@@ -144,6 +144,15 @@ between sessions; the ratios are what to read.
 | one image, cold start | 474.2 ms | **343.8 ms** | 1.4× |
 | one more image, warm | 370.5 ms | **343.3 ms** | 1.1× |
 
+Two caveats on the map row. It is **1.0× — no faster**, and that is worth stating plainly:
+the 278 ms quoted at the top was always *lensfun's* cost, and closed-form C pays essentially
+the same to push six floats per pixel through memory. And the whole table is built with this
+project's default flags — **a consumer's flags matter more than anything in this library**.
+The same map is 286 ms at plain `-O3`, 217 ms with `-march=native`, and 103 ms with
+`-ffast-math`. Ansel builds with the last, so its map costs ~100 ms, not ~300. (That also
+means its CPU results are no longer bit-identical to its GPU ones; see
+[Fused evaluation](doc/fused-evaluation.md#fused-exactness).)
+
 ### In parallel
 
 A pixel pipeline runs the per-pixel stages across threads, so they are measured that way
@@ -162,7 +171,7 @@ written in 0.041 s is about 18 GB/s, which is the memory bus rather than either 
 is also why the 1.5× single-threaded advantage disappears — LensSerious is already close to
 the ceiling with one thread.
 
-## The map, versus never building one
+## The map, versus never building one  {#readme-fused}
 
 A correction is only ever wanted so that something can **resample** with it, and that is
 where the two libraries actually differ. lensfun can only deliver a correction as a buffer:
@@ -190,6 +199,10 @@ scaling.
 
 That is the same effect the GPU shows, at the other end of the scale: a device with thousands
 of threads is so far past the crossover that not building the map is worth 165× (below).
+
+The consequences for a consumer — always fuse on a GPU, measure before fusing on a CPU, and
+why there is deliberately no `ls_correct_and_resample()` in the API — are in
+[Fused evaluation](doc/fused-evaluation.md).
 
 ## What it costs to reach a GPU
 
@@ -243,6 +256,22 @@ Where the design wins is not arithmetic, it is architecture:
 | native XML reader (dropping liblensfun from the importer) | not started |
 | CPU geometry map vectorisation | **open** — the loop is scalar because the model dispatch inside the per-pixel evaluator is loop-invariant and the compiler will not unswitch it |
 | `<real-focal-length>` interpolation | **open** — would let the last projection cases off the fallback path; the schema already has the table, the importer does not fill it |
+
+## Documentation
+
+The API reference and the design notes are generated with Doxygen and published to GitHub
+Pages by `.github/workflows/docs.yml`. To build them locally:
+
+    git submodule update --init doc/doxygen-awesome-css
+    doxygen doc/Doxyfile          # writes doc/api/html
+
+Two pages there are worth reading before changing anything:
+
+- **[Fused evaluation](doc/fused-evaluation.md)** — why the displacement map should usually
+  not exist, and the thread count at which that stops being true.
+- **[Maintainer's log](doc/maintainers.md)** — the experiments that were measured and
+  reverted, each with the number that killed it. Read it before optimising anything here;
+  most of the obvious ideas are in it already.
 
 ## License
 

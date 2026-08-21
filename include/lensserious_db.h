@@ -76,7 +76,10 @@ size_t ls_db_normalize(const char *in, char *out, size_t out_size);
  * Exposed for the same reason as ls_db_normalize(): the importer writes these into the
  * token index and the matcher looks them up, so there must be exactly one implementation.
  *
+ * @param norm a name already put through ls_db_normalize().
  * @param out_tokens caller's array of @p max buffers, each at least @p stride bytes.
+ * @param max how many tokens to write at most.
+ * @param stride the size of one buffer in @p out_tokens, in bytes.
  * @return how many tokens were written.
  */
 int ls_db_tokenize(const char *norm, char *out_tokens, int max, int stride);
@@ -190,7 +193,10 @@ typedef struct ls_db_match_t
  * upstream about their own name often enough that requiring it loses more than it saves.
  * @param mount_id when > 0, only lenses that fit this mount are considered
  * (ls_db_find_camera() supplies it). 0 considers every lens.
+ * @param db an open database.
+ * @param model the free-text name to resolve. Required.
  * @param out caller's array, @p max entries, filled best-first.
+ * @param max the length of @p out.
  * @return how many candidates were written, or -1 on error.
  */
 int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long long mount_id,
@@ -208,8 +214,10 @@ int ls_db_lens_fits_mount(ls_db_t *db, long long lens_id, long long mount_id);
 /**
  * @brief Enumerate lens ids, oldest-inserted first, for tests and for a GUI's lens picker.
  *
- * @param out_ids caller's array; @p max its length. @return how many ids were written, or
- * -1 on error. Call with @p out_ids NULL to count.
+ * @param db an open database.
+ * @param out_ids caller's array, or NULL to count only.
+ * @param max the length of @p out_ids.
+ * @return how many ids were written (or how many exist, if @p out_ids is NULL), or -1.
  */
 int ls_db_list_lenses(ls_db_t *db, long long *out_ids, int max);
 

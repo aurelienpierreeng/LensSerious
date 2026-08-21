@@ -162,9 +162,16 @@ typedef struct ls_modifier_t
 /**
  * @brief Resolve a lens at one (crop, geometry, focal, aperture, distance, scale).
  *
+ * @param mod filled in by this call; nothing in it is owned or must be freed.
+ * @param lens the lens, as data.
+ * @param crop the crop factor of the sensor the picture was TAKEN with.
+ * @param width, height the image dimensions, in pixels.
+ * @param focal, aperture, distance the shooting configuration.
+ * @param scale a linear scaling factor; 1.0 for none.
  * @param target_type the projection the output should be in, as ls_lens_type_t. Pass the
  * lens's own type (or LS_LENS_UNKNOWN) for no projection change; LS_ENABLE_GEOMETRY is
  * only raised when it actually differs and the pair is radially expressible.
+ * @param flags which LS_ENABLE_* axes to attempt.
  * @return the LS_ENABLE_* flags actually in effect, mirroring lensfun's oflags.
  */
 int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,

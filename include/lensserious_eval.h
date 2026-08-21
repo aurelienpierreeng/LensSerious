@@ -203,19 +203,6 @@ static inline void ls_eval_tca(const ls_eval_t *p, float *xr, float *yr, float *
 }
 
 /**
- * @brief The map for ONE output pixel: six floats, source coordinates for R, G, B.
- *
- * @param xu absolute output column, in pixels. @param yu absolute output row.
- * @param out six floats: xr yr xg yg xb yb, the layout of
- * lfModifier::ApplySubpixelGeometryDistortion()'s buffer.
- *
- * @details @p xu and @p yu are ABSOLUTE, already summed by the caller -- a row walker
- * passes `xu + col`, a work-item passes `xu + get_global_id(0)`. Both then evaluate the
- * identical expression on the identical float, which is what makes the CPU row loop and
- * the kernel agree bit for bit rather than merely closely. Do not "optimise" this into
- * taking an origin plus an index: the two would then round differently.
- */
-/**
  * @brief Field angle for a radius, under one projection. Negative if @p model has none.
  *
  * @details The destination half of a projection change: the output image is in @p model's
@@ -283,6 +270,24 @@ static inline int ls_eval_geometry(const ls_eval_t *p, float *x, float *y)
   return 1;
 }
 
+/**
+ * @brief The map for ONE output pixel: six floats, source coordinates for R, G, B.
+ *
+ * @param p the lens resolved at one shooting configuration.
+ * @param xu absolute output column, in pixels.
+ * @param yu absolute output row, in pixels.
+ * @param out six floats: xr yr xg yg xb yb, the layout of
+ * lfModifier::ApplySubpixelGeometryDistortion()'s buffer.
+ *
+ * @details @p xu and @p yu are ABSOLUTE, already summed by the caller -- a row walker
+ * passes `xu + col`, a work-item passes `xu + get_global_id(0)`. Both then evaluate the
+ * identical expression on the identical float, which is what makes the CPU row loop and
+ * the kernel agree bit for bit rather than merely closely. Do not "optimise" this into
+ * taking an origin plus an index: the two would then round differently.
+ *
+ * @see @ref fused-evaluation for why a consumer should usually call this in the loop that
+ * needs the coordinates, rather than filling a buffer with it.
+ */
 static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *out)
 {
   float x = xu * p->norm_scale - p->center_x;
