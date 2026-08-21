@@ -143,10 +143,38 @@ Head-to-head against liblensfun 0.3.4, 24 Mpx, single-threaded, both sides on th
 
 **The geometry map is not faster on the CPU**, and that is worth stating plainly: the 278 ms
 quoted above was always *lensfun's* cost, and closed-form C pays essentially the same to
-push six floats per pixel through memory. That loop does not vectorise either — the model
-dispatch inside the per-pixel evaluator is loop-invariant but the compiler will not unswitch
-it, so the generated code is 10 scalar divides and 10 scalar square roots. Real work left on
-the table, and the row that matters least, because on a GPU that map is never built.
+push six floats per pixel through memory.
+
+The table above is built with the project's default flags. **A consumer's flags matter far
+more than anything in this library**: the same map, same code, 24 Mpx —
+
+| build flags | LensSerious |
+|---|---|
+| `-O3` (baseline x86-64) | 286 ms |
+| `-O3 -march=native` | 217 ms |
+| `-O3 -march=native -ffast-math` | **103 ms** |
+
+Ansel compiles with the last of those, so the map there costs ~100 ms, not the 300 the
+benchmark reports. (`-ffast-math` also means Ansel's CPU results are no longer bit-identical
+to its GPU ones — the parity harness is built without it, and that is where the bit-exactness
+claim holds.)
+
+Four attempts to close the remaining gap to a hand-written specialised loop (~75 ms) were
+measured and **all reverted**, which is why the code still looks the way it does:
+
+- **specialising all twelve (distortion, TCA) pairs** — far worse, 103 → 263 ms: twelve call
+  sites exhaust the inliner's budget, so nothing folds at all;
+- **specialising only the dominant pair** (ptlens + poly3, which is 4810/5690 and 3355/3361
+  of the database) — no change;
+- **`restrict` on the evaluator arguments** — ~5%, within the run-to-run noise;
+- **making the row the primitive and the pixel `count == 1`**, so the row's `y·scale − centre`
+  and ptlens's `1 − a − b − c` are hoisted — no change (100.7 ms against 101.1, best of five).
+
+What remains is arithmetic: one square root and ~20 flops per pixel, and a 24-byte scatter
+into an interleaved output whose layout is fixed by compatibility with lensfun's buffer.
+Closing it needs SIMD across pixels with SoA staging, which is a different function and puts
+the CPU/GPU bit-exactness at risk. It is also the row that matters least, because on a GPU
+the map is never built at all.
 
 The **fuzzy lookup** was 2.89 ms — 96× slower — until it was profiled. It was not the
 database losing to an in-memory search, it was two mistakes. It scored every one of the
