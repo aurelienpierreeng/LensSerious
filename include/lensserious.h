@@ -146,6 +146,7 @@ typedef struct ls_modifier_t
   float width, height;        /* the (dimension − 1) values, lensfun's own convention */
 
   int   enabled;              /* LS_ENABLE_* actually resolved (calibration present) */
+  int   reverse;              /* non-zero for the reverse direction (lensfun's `reverse`) */
   /* Set when the requested projection change cannot be expressed radially -- panoramic or
    * equirectangular on either side. Those two map x and y differently; everything else
    * (rectilinear, the four fisheyes, thoby) goes through ls_eval_geometry(). */
@@ -172,12 +173,19 @@ typedef struct ls_modifier_t
  * lens's own type (or LS_LENS_UNKNOWN) for no projection change; LS_ENABLE_GEOMETRY is
  * only raised when it actually differs and the pair is radially expressible.
  * @param flags which LS_ENABLE_* axes to attempt.
+ * @param reverse non-zero to resolve the REVERSE direction -- the transform that takes a
+ * corrected coordinate back to where it came from in the source image, which is what a
+ * consumer needs to place masks and drawn shapes on an image it is correcting. It is not
+ * the same chain read backwards: upstream registers different callbacks at different
+ * priorities, so the composition order changes too (see ls_eval_t::reverse). An axis whose
+ * model cannot be inverted at these coefficients -- poly3 distortion with k1 = 0, linear
+ * TCA with a zero term -- is dropped from the returned flags exactly as upstream drops it.
  * @return the LS_ENABLE_* flags actually in effect, mirroring lensfun's oflags.
  */
 int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                      float crop, int width, int height,
                      float focal, float aperture, float distance,
-                     float scale, int target_type, int flags);
+                     float scale, int target_type, int flags, int reverse);
 
 /**
  * @brief Flatten a resolved modifier into the scalar block a kernel can take by value.

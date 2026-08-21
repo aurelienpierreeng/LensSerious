@@ -222,7 +222,7 @@ static int _interp_vig(const ls_lens_t *lens, float focal, float aperture, float
 int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                      float crop, int width, int height,
                      float focal, float aperture, float distance,
-                     float scale, int target_type, int flags)
+                     float scale, int target_type, int flags, int reverse)
 {
   memset(mod, 0, sizeof(*mod));
   if(!lens || crop <= 0.f) return 0;
@@ -301,6 +301,19 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
    * reverse and was wrong. */
   if(from != to && radial && lens->has_real_focal) mod->geometry_unsupported = 1;
 
+  mod->reverse = reverse ? 1 : 0;
+
+  /* The reverse direction swaps the projection endpoints (modifier.cpp: reverse ?
+   * AddCoordCallbackGeometry(targeom, lens->Type, ...) : the other way round). Everything
+   * downstream reads geom_from/geom_to, so doing it once here keeps the evaluator free of
+   * the distinction. */
+  if(mod->reverse)
+  {
+    const int swap = mod->geom_from;
+    mod->geom_from = mod->geom_to;
+    mod->geom_to = swap;
+  }
+
   int enabled = 0;
   if(from != to && radial && !lens->has_real_focal && focal > 0.f) enabled |= LS_ENABLE_GEOMETRY;
   if((flags & LS_ENABLE_DISTORTION) && _interp_dist(lens, focal, &mod->dist))
@@ -311,11 +324,26 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
     enabled |= LS_ENABLE_VIGNETTING;
   if((flags & LS_ENABLE_SCALE) && scale != 1.0f && scale > 0.f)
   {
-    mod->scale = 1.f / scale;   /* upstream stores the reciprocal for the correction pass */
+    /* Upstream stores 1/scale for the correction pass and `scale` itself for the reverse
+     * one, and moves the callback from priority 100 to 900 (mod-coord.cpp,
+     * AddCoordCallbackScale). Both halves of that matter; the order lives in ls_eval_map. */
+    mod->scale = mod->reverse ? scale : 1.f / scale;
     enabled |= LS_ENABLE_SCALE;
   }
   else
     mod->scale = 1.f;
+
+  /* Two models have no closed inverse at every coefficient, and upstream simply refuses
+   * the axis rather than producing something wrong: AddCoordCallbackDistortion returns
+   * false for poly3 with k1 = 0 (its reverse form is 1/k1), and AddSubpixelCallbackTCA
+   * returns false for linear TCA with a zero term (same reason). A refused axis is absent
+   * from lensfun's oflags, so it must be absent from ours. */
+  if(mod->reverse && (enabled & LS_ENABLE_DISTORTION)
+     && mod->dist.model == LS_DIST_POLY3 && mod->dist.terms[0] == 0.f)
+    enabled &= ~LS_ENABLE_DISTORTION;
+  if(mod->reverse && (enabled & LS_ENABLE_TCA) && mod->tca.model == LS_TCA_LINEAR
+     && (mod->tca.terms[0] == 0.f || mod->tca.terms[1] == 0.f))
+    enabled &= ~LS_ENABLE_TCA;
 
   mod->enabled = enabled;
   return enabled;
@@ -391,6 +419,27 @@ int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
   for(int i = 0; i < 3; i++) out->dist_terms[i] = mod->dist.terms[i];
   for(int i = 0; i < 6; i++) out->tca_terms[i] = mod->tca.terms[i];
   for(int i = 0; i < 3; i++) out->vig_terms[i] = mod->vig.terms[i];
+
+  out->reverse = mod->reverse;
+  if(mod->reverse)
+  {
+    /* Two models are stored in a different FORM for the reverse pass, because upstream
+     * bakes the reciprocal into the callback's data block rather than taking it per pixel
+     * (mod-coord.cpp AddCoordCallbackDistortion, mod-subpix.cpp AddSubpixelCallbackTCA).
+     * Doing the same here keeps the per-pixel path free of a divide, and keeps the kernel
+     * -- which sees only this block -- free of the distinction.
+     *
+     * The zero cases cannot arrive: ls_modifier_init() has already cleared the enable bit
+     * for exactly the coefficients that would divide by zero here. */
+    /* Distortion terms stay as-is: the reverse solver uses the UNSCALED equation, not
+     * upstream's monic form, because dividing poly3 through by k1 makes the residual
+     * unresolvable in float for the small k1 real lenses have (see ls_eval_undist_factor). */
+    if(out->tca_model == LS_EVAL_TCA_LINEAR && (out->enabled & LS_ENABLE_TCA))
+    {
+      out->tca_terms[0] = 1.f / mod->tca.terms[0];
+      out->tca_terms[1] = 1.f / mod->tca.terms[1];
+    }
+  }
 
   return 1;
 }

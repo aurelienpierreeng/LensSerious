@@ -164,7 +164,7 @@ int main(int argc, char **argv)
   }
   ls_modifier_t mod;
   ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f, LS_LENS_UNKNOWN,
-                   LS_ENABLE_DISTORTION | LS_ENABLE_TCA | LS_ENABLE_VIGNETTING);
+                   LS_ENABLE_DISTORTION | LS_ENABLE_TCA | LS_ENABLE_VIGNETTING, 0);
   ls_eval_t p;
   ls_eval_from_modifier(&mod, &p);
 

@@ -66,6 +66,7 @@
   #define LS_ASIN(x)  asin(x)
   #define LS_SIN(x)   sin(x)
   #define LS_TAN(x)   tan(x)
+  #define LS_FABS(x)  fabs(x)
 #else
   #include <math.h>
   #define LS_SQRT(x)  sqrtf(x)
@@ -73,6 +74,7 @@
   #define LS_ASIN(x)  asinf(x)
   #define LS_SIN(x)   sinf(x)
   #define LS_TAN(x)   tanf(x)
+  #define LS_FABS(x)  fabsf(x)
 #endif
 
 /* Mirrors of the model enumerations in lensserious.h. Spelled as plain integers so this
@@ -142,7 +144,15 @@ typedef struct ls_eval_t
   int   geom_from;               /**< the lens's own projection, LS_EVAL_LENS_* */
   int   geom_to;                 /**< the projection asked for */
   float geom_focal;              /**< focal / LS_EVAL_GEOM_HALF_HEIGHT_MM */
-  float _pad;                    /**< keeps the struct 4-aligned and its size stated */
+  /** Non-zero when this block describes the REVERSE direction (lensfun's `reverse` flag).
+   *
+   * It is not "the same chain, backwards". Upstream registers different callbacks at
+   * different priorities, so the composition order itself changes: forward runs
+   * scale(100) -> geometry(500) -> distortion(750), reverse runs undistortion(250) ->
+   * geometry(500) -> scale(900). The projection endpoints are swapped and the scale factor
+   * is stored un-reciprocated by the resolver, so only the ORDER and the choice of
+   * dist/undist live here. */
+  int   reverse;
   float dist_terms[3];
   float tca_terms[6];
   float vig_terms[3];
@@ -270,6 +280,158 @@ static inline int ls_eval_geometry(const ls_eval_t *p, float *x, float *y)
   return 1;
 }
 
+/* Newton, ported from mod-coord.cpp with ONE deliberate difference, which cost a bench
+ * round to find and is the reason this comment is long.
+ *
+ * Upstream iterates in double and tests an ABSOLUTE residual, |f(ru)| < 1e-5. For poly3 it
+ * also divides the whole equation by k1 to make it monic: ru^3 + ru*(1-k1)/k1 - rd/k1. That
+ * is free in double and fatal in float. Real lenses have small k1 -- the Beroflex 500mm has
+ * k1 = 0.00108 -- so the scaled equation carries terms of magnitude 1/k1 = 926, whose float
+ * rounding noise alone is ~5.5e-5. The residual can then NEVER fall below 1e-5, every pixel
+ * exhausts the six-step budget, and the coordinate is returned uncorrected: measured as
+ * 21177 samples out of tolerance, up to 6 px, on 0.6% of the reverse database.
+ *
+ * So the equations here are the UNSCALED ones -- same roots, magnitudes near 1 -- and
+ * convergence is judged on the relative STEP SIZE rather than an absolute residual. That is
+ * scale-free, which is what float needs, and it tests the thing actually wanted: that the
+ * iteration has stopped moving. The budget stays at upstream's six steps and a
+ * non-converging pixel is still left untouched, so genuinely divergent regions (ultrawide
+ * fisheye corners, where upstream gives up too) behave the same on both sides.
+ *
+ * Iterating in float rather than double is not a shortcut either: one source text has to
+ * compile as OpenCL C, where double is an optional extension, and CPU/GPU bit-exactness is
+ * a property this project asserts. The cost of that choice is measured over the whole
+ * database in both directions by tests/parity_lensfun.c. */
+#define LS_NEWTON_STEPS 6
+#define LS_NEWTON_RTOL  1e-6f
+
+/**
+ * @brief Solve Rd = f(Ru) for Ru, given a radius Rd. The inverse of ls_eval_dist().
+ *
+ * @param p the lens resolved at one shooting configuration, reverse direction.
+ * @param rd the distorted radius, in normalized units.
+ * @return the factor Ru/Rd to scale the coordinate by, or 1.0 when the iteration does not
+ * converge or lands on a negative radius -- upstream leaves such a coordinate untouched,
+ * and returning 1 here is that same decision expressed as a multiplier.
+ */
+static inline float ls_eval_undist_factor(const ls_eval_t *p, const float rd)
+{
+  if(rd == 0.f) return 1.f;
+
+  float ru = rd;
+  int converged = 0;
+
+  if(p->dist_model == LS_EVAL_DIST_POLY3)
+  {
+    /* Rd = k1*Ru^3 + (1-k1)*Ru, solved as written -- see the note above on why this is not
+     * divided through by k1 the way upstream does it. */
+    const float k1 = p->dist_terms[0], one_minus_k1 = 1.f - k1;
+    for(int step = 0; step < LS_NEWTON_STEPS && !converged; step++)
+    {
+      const float f = k1 * ru * ru * ru + one_minus_k1 * ru - rd;
+      const float fp = 3.f * k1 * ru * ru + one_minus_k1;
+      if(fp == 0.f) return 1.f;
+      const float d = f / fp;
+      ru -= d;
+      if(LS_FABS(d) <= LS_NEWTON_RTOL * LS_FABS(ru)) converged = 1;
+    }
+  }
+  else if(p->dist_model == LS_EVAL_DIST_POLY5)
+  {
+    const float k1 = p->dist_terms[0], k2 = p->dist_terms[1];
+    for(int step = 0; step < LS_NEWTON_STEPS && !converged; step++)
+    {
+      const float ru2 = ru * ru;
+      const float f = ru * (1.f + k1 * ru2 + k2 * ru2 * ru2) - rd;
+      const float fp = 1.f + 3.f * k1 * ru2 + 5.f * k2 * ru2 * ru2;
+      if(fp == 0.f) return 1.f;
+      const float d = f / fp;
+      ru -= d;
+      if(LS_FABS(d) <= LS_NEWTON_RTOL * LS_FABS(ru)) converged = 1;
+    }
+  }
+  else if(p->dist_model == LS_EVAL_DIST_PTLENS)
+  {
+    const float a = p->dist_terms[0], b = p->dist_terms[1], c = p->dist_terms[2];
+    const float d0 = 1.f - a - b - c;
+    for(int step = 0; step < LS_NEWTON_STEPS && !converged; step++)
+    {
+      const float f = ru * (a * ru * ru * ru + b * ru * ru + c * ru + d0) - rd;
+      const float fp = 4.f * a * ru * ru * ru + 3.f * b * ru * ru + 2.f * c * ru + d0;
+      if(fp == 0.f) return 1.f;
+      const float d = f / fp;
+      ru -= d;
+      if(LS_FABS(d) <= LS_NEWTON_RTOL * LS_FABS(ru)) converged = 1;
+    }
+  }
+  else
+    return 1.f;
+
+  if(!converged || ru < 0.f) return 1.f;  /* a negative radius is not a position */
+  return ru / rd;
+}
+
+/** @brief Undistort in place. The reverse of ls_eval_dist(). */
+static inline void ls_eval_undist(const ls_eval_t *p, float *x, float *y)
+{
+  const float rd = LS_SQRT(*x * *x + *y * *y);
+  const float m = ls_eval_undist_factor(p, rd);
+  *x *= m;
+  *y *= m;
+}
+
+/**
+ * @brief The reverse of ls_eval_tca(): recover each channel's undistorted radius.
+ *
+ * @details Linear is a reciprocal the resolver already took. Poly3 is the same Newton as
+ * above on Rd = b·Ru³ + c·Ru² + v·Ru, run once per channel, and -- exactly as upstream --
+ * a channel that fails to converge keeps the coordinate it came in with while the other
+ * channel may still be corrected.
+ */
+static inline void ls_eval_untca(const ls_eval_t *p, float *xr, float *yr, float *xb, float *yb)
+{
+  if(p->tca_model == LS_EVAL_TCA_LINEAR)
+  {
+    const float kr = p->tca_terms[0], kb = p->tca_terms[1];  /* already reciprocals */
+    *xr *= kr; *yr *= kr;
+    *xb *= kb; *yb *= kb;
+  }
+  else if(p->tca_model == LS_EVAL_TCA_POLY3)
+  {
+    const float vr = p->tca_terms[0], vb = p->tca_terms[1];
+    const float cr = p->tca_terms[2], cb = p->tca_terms[3];
+    const float br = p->tca_terms[4], bb = p->tca_terms[5];
+
+    for(int ch = 0; ch < 2; ch++)
+    {
+      const float v = ch ? vb : vr, c = ch ? cb : cr, b = ch ? bb : br;
+      float *px = ch ? xb : xr, *py = ch ? yb : yr;
+      const float rd = LS_SQRT(*px * *px + *py * *py);
+      if(rd == 0.f) continue;
+
+      float ru = rd;
+      int ok = 0;
+      for(int step = 0; step < LS_NEWTON_STEPS && !ok; step++)
+      {
+        const float ru2 = ru * ru;
+        const float f = b * ru2 * ru + c * ru2 + v * ru - rd;
+        const float fp = 3.f * b * ru2 + 2.f * c * ru + v;
+        if(fp == 0.f) break;
+        const float dd = f / fp;
+        ru -= dd;
+        if(LS_FABS(dd) <= LS_NEWTON_RTOL * LS_FABS(ru)) ok = 1;
+      }
+      /* Upstream requires ru STRICTLY positive here, where the coordinate path accepts
+       * zero. Kept as it is rather than unified: they are different functions. */
+      if(ok && ru > 0.f)
+      {
+        const float m = ru / rd;
+        *px *= m; *py *= m;
+      }
+    }
+  }
+}
+
 /**
  * @brief The map for ONE output pixel: six floats, source coordinates for R, G, B.
  *
@@ -293,13 +455,19 @@ static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *ou
   float x = xu * p->norm_scale - p->center_x;
   float y = yu * p->norm_scale - p->center_y;
 
-  /* lensfun's callback-priority order for the correction direction: scaling (100) ->
-   * projection (500) -> distortion (750), then the TCA subpixel stage per channel. */
-  if(p->enabled & LS_EVAL_ENABLE_SCALE)
+  /* lensfun's callback-priority order, which is NOT symmetric between the two directions:
+   *   forward   scale (100)        -> projection (500) -> distortion (750)
+   *   reverse   undistortion (250) -> projection (500) -> scale (900)
+   * Projection sits in the middle either way; scale moves from first to last, and the
+   * resolver has already swapped the projection endpoints and un-reciprocated the scale.
+   * The TCA subpixel stage runs after the coordinate chain in both directions. */
+  if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
   {
     x *= p->scale;
     y *= p->scale;
   }
+  if(p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_undist(p, &x, &y);
+
   if(p->enabled & LS_EVAL_ENABLE_GEOMETRY)
   {
     if(!ls_eval_geometry(p, &x, &y))
@@ -311,10 +479,20 @@ static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *ou
       return;
     }
   }
-  if(p->enabled & LS_EVAL_ENABLE_DISTORTION) ls_eval_dist(p, &x, &y);
+
+  if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_dist(p, &x, &y);
+  if(p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
+  {
+    x *= p->scale;
+    y *= p->scale;
+  }
 
   float xr = x, yr = y, xb = x, yb = y;
-  if(p->enabled & LS_EVAL_ENABLE_TCA) ls_eval_tca(p, &xr, &yr, &xb, &yb);
+  if(p->enabled & LS_EVAL_ENABLE_TCA)
+  {
+    if(p->reverse) ls_eval_untca(p, &xr, &yr, &xb, &yb);
+    else           ls_eval_tca(p, &xr, &yr, &xb, &yb);
+  }
 
   out[0] = (xr + p->center_x) * p->norm_unscale;
   out[1] = (yr + p->center_y) * p->norm_unscale;

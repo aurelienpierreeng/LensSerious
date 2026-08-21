@@ -216,7 +216,7 @@ int main(int argc, char **argv)
   for(int i = 0; i < INITS; i++)
     ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f,
                      LS_LENS_UNKNOWN,
-                     LS_ENABLE_DISTORTION | LS_ENABLE_TCA | LS_ENABLE_VIGNETTING);
+                     LS_ENABLE_DISTORTION | LS_ENABLE_TCA | LS_ENABLE_VIGNETTING, 0);
   const double t_ls_init = (now_ms() - t) / INITS;
   row("resolve at focal/aperture", t_lf_init, t_ls_init, "ms");
 
@@ -247,7 +247,7 @@ int main(int argc, char **argv)
               lf_modifier_apply_subpixel_geometry_distortion(m, 0.f, (float)y, W, 1, buf));
 
   ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f, LS_LENS_UNKNOWN,
-                   LS_ENABLE_DISTORTION | LS_ENABLE_TCA);
+                   LS_ENABLE_DISTORTION | LS_ENABLE_TCA, 0);
   double t_ls_map;
   TIME_BEST(t_ls_map,
             for(int y = 0; y < H; y++)
@@ -296,7 +296,7 @@ int main(int argc, char **argv)
   lf_modifier_destroy(m);
 
   ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f, LS_LENS_UNKNOWN,
-                   LS_ENABLE_VIGNETTING);
+                   LS_ENABLE_VIGNETTING, 0);
   double t_ls_vig;
   TIME_BEST(t_ls_vig,
             for(int y = 0; y < H; y++)
@@ -324,7 +324,7 @@ int main(int argc, char **argv)
       lf_modifier_destroy(vm);
 
       ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f, LS_LENS_UNKNOWN,
-                       LS_ENABLE_VIGNETTING);
+                       LS_ENABLE_VIGNETTING, 0);
       TIME_BEST(t_ls_vig_mt,
                 _Pragma("omp parallel for schedule(static)")
                 for(int y = 0; y < H; y++)
@@ -375,7 +375,7 @@ int main(int argc, char **argv)
       lf_modifier_initialize(fm, lf, LF_PF_F32, focal, aperture, distance, 1.f,
                              LF_RECTILINEAR, LF_MODIFY_DISTORTION | LF_MODIFY_TCA, 0);
       ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f,
-                       LS_LENS_UNKNOWN, LS_ENABLE_DISTORTION | LS_ENABLE_TCA);
+                       LS_LENS_UNKNOWN, LS_ENABLE_DISTORTION | LS_ENABLE_TCA, 0);
       ls_eval_t ep;
       ls_eval_from_modifier(&mod, &ep);
 
