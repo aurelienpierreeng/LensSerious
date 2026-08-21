@@ -433,6 +433,45 @@ static inline void ls_eval_untca(const ls_eval_t *p, float *xr, float *yr, float
 }
 
 /**
+ * @brief The coordinate chain: scale, projection and distortion, in direction order.
+ *
+ * @param p the lens resolved at one shooting configuration.
+ * @param x, y a point in normalized coordinates, transformed in place.
+ * @return 0 when the point has no source pixel at all, in which case @p x and @p y are
+ * untouched and the caller decides what to write.
+ *
+ * @details Everything lensfun registers as a COORDINATE callback and nothing else -- TCA is
+ * a subpixel callback and runs after, vignetting is a colour callback. It exists as its own
+ * function because autoscaling has to evaluate exactly this, and a second copy written for
+ * that purpose would be a second copy to drift.
+ *
+ * The order is not symmetric between the directions:
+ *   forward   scale (100)        -> projection (500) -> distortion (750)
+ *   reverse   undistortion (250) -> projection (500) -> scale (900)
+ * The projection sits in the middle either way; scale moves from first to last, and the
+ * resolver has already swapped the projection endpoints and un-reciprocated the scale.
+ */
+static inline int ls_eval_coord_chain(const ls_eval_t *p, float *x, float *y)
+{
+  if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
+  {
+    *x *= p->scale;
+    *y *= p->scale;
+  }
+  if(p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_undist(p, x, y);
+
+  if((p->enabled & LS_EVAL_ENABLE_GEOMETRY) && !ls_eval_geometry(p, x, y)) return 0;
+
+  if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_dist(p, x, y);
+  if(p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
+  {
+    *x *= p->scale;
+    *y *= p->scale;
+  }
+  return 1;
+}
+
+/**
  * @brief The map for ONE output pixel: six floats, source coordinates for R, G, B.
  *
  * @param p the lens resolved at one shooting configuration.
@@ -461,30 +500,13 @@ static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *ou
    * Projection sits in the middle either way; scale moves from first to last, and the
    * resolver has already swapped the projection endpoints and un-reciprocated the scale.
    * The TCA subpixel stage runs after the coordinate chain in both directions. */
-  if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
+  if(!ls_eval_coord_chain(p, &x, &y))
   {
-    x *= p->scale;
-    y *= p->scale;
-  }
-  if(p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_undist(p, &x, &y);
-
-  if(p->enabled & LS_EVAL_ENABLE_GEOMETRY)
-  {
-    if(!ls_eval_geometry(p, &x, &y))
-    {
-      /* No source pixel. NaN is what lensfun writes here too, and every consumer in this
-       * project already checks for it (do_nan_checks in the kernels, isfinite() on the
-       * CPU) before sampling. */
-      for(int k = 0; k < 6; k++) out[k] = (float)(0.0f / 0.0f);
-      return;
-    }
-  }
-
-  if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_dist(p, &x, &y);
-  if(p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
-  {
-    x *= p->scale;
-    y *= p->scale;
+    /* No source pixel. NaN is what lensfun writes here too, and every consumer in this
+     * project already checks for it (do_nan_checks in the kernels, isfinite() on the CPU)
+     * before sampling. */
+    for(int k = 0; k < 6; k++) out[k] = (float)(0.0f / 0.0f);
+    return;
   }
 
   float xr = x, yr = y, xb = x, yb = y;

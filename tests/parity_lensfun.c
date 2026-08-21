@@ -62,6 +62,14 @@ unsigned int _ls_no_cpu_features(void) { return 0; }
  * consumer actually uses to place masks -- stays on the strict absolute tolerance and is
  * reported as its own number, so this exemption cannot quietly absorb a real regression. */
 #define TOL_GEOMETRY_REL 1e-3f
+/* Relative, and set at TWICE upstream's own declared accuracy rather than at some tighter
+ * number that would look stricter and mean less. Upstream: "1 permille is our limit of
+ * accuracy (in rare cases, we may be even worse, depending on what happens between the test
+ * points)", which is also the flat margin it multiplies in. Both sides are Newton searches
+ * with numeric derivatives over the same landscape; asking them to agree to better than the
+ * accuracy either one claims is asking about the search's rounding, not about the scale.
+ * Measured worst outside the horizon regime: 1.05e-3. */
+#define TOL_AUTOSCALE    2e-3f
 
 /**
  * @brief Did these two coordinates agree?
@@ -213,6 +221,8 @@ int main(int argc, char **argv)
   const lfLens *const *lenses = lf_db_get_lenses(ldb);
   int total = 0, compared = 0, skipped_geometry = 0, failed = 0, flag_mismatch = 0;
   int divergent = 0, declined = 0, bad_decline = 0;
+  int autoscale_compared = 0, autoscale_failed = 0, autoscale_horizon = 0;
+  float autoscale_worst = 0.f; char autoscale_name[256] = "";
   int vig_compared = 0, vig_failed = 0;
   float worst_px = 0.f, worst_vig = 0.f;
   char worst_name[256] = "", worst_vig_name[256] = "";
@@ -406,6 +416,54 @@ int main(int argc, char **argv)
           }
       }
 
+      /* Autoscale parity. It is a Newton search with a numeric derivative over the whole
+       * coordinate chain, so it compounds every difference in that chain into one number --
+       * which makes it a good end-to-end check and a bad place to expect exactness. The
+       * tolerance is relative and generous for that reason: what matters to a consumer is
+       * that the frame ends up filled, and a permille of scale is a fraction of the flat
+       * permille margin upstream already adds. */
+      if((refmods & (LF_MODIFY_DISTORTION | LF_MODIFY_GEOMETRY))
+         && (mymods & (LS_ENABLE_DISTORTION | LS_ENABLE_GEOMETRY))
+         && !mod.geometry_unsupported)
+      {
+        const float lf_s = lf_modifier_get_auto_scale(ref, rev);
+        const float ls_s = ls_modifier_autoscale(&mod);
+        autoscale_compared++;
+        if(isfinite(lf_s) && isfinite(ls_s) && lf_s > 0.f && ls_s > 0.f)
+        {
+          const float rel = fabsf(lf_s - ls_s) / lf_s;
+          if(rel > autoscale_worst && !(rev && (mymods & LS_ENABLE_GEOMETRY)))
+          {
+            autoscale_worst = rel;
+            snprintf(autoscale_name, sizeof(autoscale_name), "%s @ %.1fmm %s (lf %.5f ls %.5f)",
+                     lf->Model, focal, rev ? "REVERSE" : "forward", lf_s, ls_s);
+          }
+          if(rel > TOL_AUTOSCALE)
+          {
+            /* Same regime, same reason as the geometry exemption above, and constrained the
+             * same way. Autoscale is a Newton search over the coordinate chain; where that
+             * chain is reversing a projection whose horizon falls inside the frame, the
+             * residual landscape is non-monotonic and the two searches settle on different
+             * local solutions -- upstream walking over its wrapped tangents, this one over
+             * the sentinel. There is no scale that removes the black borders there, because
+             * the transform is not a bijection over the frame. Measured 12 configurations
+             * out of 18100, every one of them reverse-with-projection-change. Anywhere else
+             * it is a defect and fails the run. */
+            if(rev && (mymods & LS_ENABLE_GEOMETRY)) autoscale_horizon++;
+            else
+            {
+              autoscale_failed++;
+              if(autoscale_failed < 8)
+                fprintf(stderr, "parity: autoscale %s @ %.1fmm %s lf=%.5f ls=%.5f rel=%.3f"
+                        " -- outside the reversed-projection regime\n", lf->Model, focal,
+                        rev ? "REVERSE" : "forward", lf_s, ls_s, rel);
+            }
+          }
+        }
+        else if(isfinite(lf_s) != isfinite(ls_s))
+          autoscale_failed++;
+      }
+
       /* Vignetting parity, where both sides resolved the pa model. */
       lfModifier *vref = lf_modifier_new(lf, crop, W, H);
       const int vrefmods = lf_modifier_initialize(vref, lf, LF_PF_F32, focal, 8.f, 1000.f, 1.f,
@@ -477,10 +535,18 @@ int main(int argc, char **argv)
          divergent, TOL_GEOMETRY_REL);
   printf("parity: %d oflag mismatches against upstream (axes refused on one side only)\n",
          flag_mismatch);
+  printf("parity: autoscale over %d configurations, worst %.2e relative (%s), tolerance %g"
+         " -> %s\n", autoscale_compared, autoscale_worst,
+         autoscale_name[0] ? autoscale_name : "none", TOL_AUTOSCALE,
+         autoscale_failed ? "FAIL" : "pass");
+  printf("parity: %d autoscale configurations differ where a reversed projection's horizon"
+         " falls inside the frame (no scale removes those borders); %d elsewhere\n",
+         autoscale_horizon, autoscale_failed);
   printf("parity: worst vignetting delta %.6f (%s), tolerance %g -> %s\n",
          worst_vig, worst_vig_name, TOL_VIGNETTING, vig_failed ? "FAIL" : "pass");
   if(flag_mismatch) failed += flag_mismatch;
   if(bad_decline) failed += bad_decline;
+  if(autoscale_failed) failed += autoscale_failed;
   if(failed || vig_failed)
   {
     printf("parity: %d geometry samples, %d vignetting samples out of tolerance\n", failed, vig_failed);

@@ -182,6 +182,32 @@ typedef struct ls_modifier_t
  * TCA with a zero term -- is dropped from the returned flags exactly as upstream drops it.
  * @return the LS_ENABLE_* flags actually in effect, mirroring lensfun's oflags.
  */
+/**
+ * @brief The scale that just removes the black borders a correction leaves behind.
+ *
+ * @param mod a resolved modifier. Its own scale factor, if it has one, is part of the
+ * transform being measured -- exactly as upstream measures whatever callbacks are
+ * registered at the time.
+ * @return the linear factor to feed back as ls_modifier_init()'s @p scale, or 1.0 when the
+ * modifier transforms no coordinates at all.
+ *
+ * @details Ported from lfModifier::GetAutoScale(). Eight points around the frame -- the
+ * four edge midpoints and the four corners -- are pushed through the coordinate chain, and
+ * the largest ratio of where a point should be to where it landed is the scale. It is a
+ * measurement, not a formula: there is no closed form for "where does the corner of a
+ * distorted, reprojected frame end up", so each point is found by Newton iteration on the
+ * chain itself with a numeric derivative.
+ *
+ * Two upstream constants are kept rather than tidied, because they are what its renders
+ * were produced with: a flat 1.001 margin ("1 permille is our limit of accuracy"), and a
+ * second 1.001 when TCA is active, since the per-channel radii extend slightly past the
+ * green one that was measured.
+ *
+ * @note Where a point cannot be found -- ultrawide fisheye corners extending to infinity --
+ * upstream lets the iteration fail and the point simply loses the max(). Same here.
+ */
+float ls_modifier_autoscale(const ls_modifier_t *mod);
+
 int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                      float crop, int width, int height,
                      float focal, float aperture, float distance,

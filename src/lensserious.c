@@ -390,6 +390,112 @@ _Static_assert(sizeof(ls_eval_t) == 8 * sizeof(float)      /* the coordinate sys
                "ls_eval_t gained padding or a member: check it is still scalar-only");
 _Static_assert(_Alignof(ls_eval_t) == _Alignof(float), "ls_eval_t alignment is no longer 4");
 
+/* How far outside the frame a point landed, as a signed distance: negative inside,
+ * positive outside, zero exactly on the edge. Upstream's AutoscaleResidualDistance(). */
+static float _autoscale_residual(const ls_eval_t *p, const float max_x, const float max_y,
+                                 const float x, const float y)
+{
+  float r = x - max_x;
+  float t = -max_x - x;   if(t > r) r = t;
+  t = y - max_y;          if(t > r) r = t;
+  t = -max_y - y;         return (t > r) ? t : r;
+  (void)p;
+}
+
+/* What a point with no source pixel counts as, while SEARCHING. ls_eval_map() answers NaN
+ * there, which is the right answer for a renderer and a useless one for Newton: the search
+ * has to be able to tell "far outside" from "further outside" to walk back in. Upstream has
+ * no such split -- its geometry callbacks answer with this very constant
+ * (mod-coord.cpp: `if (theta >= M_PI / 2.0) rho = 1.6e16F`) and the search consumes it like
+ * any other coordinate. Using the same number here reproduces the same trajectory: the
+ * residual is proportional to ru, so the first step collapses ru towards zero and the
+ * iteration then walks back out to the edge. Aborting the search instead -- which is what
+ * this did first -- leaves the maximum to be set by whichever points did resolve, and
+ * measured 99.8 against upstream's 1.219 on the Canon EF 8-15mm reversed. */
+#define LS_GEOM_SENTINEL 1.6e16f
+
+/* The radius, along one direction, whose transformed point lands exactly on the frame edge.
+ * Newton with a NUMERIC derivative, because the chain has no closed inverse -- and with
+ * upstream's dx-doubling escape for when the two probes are too close to tell apart. */
+static float _autoscale_distance(const ls_eval_t *p, const float ca, const float sa,
+                                 const float dist, const float max_x, const float max_y)
+{
+  float ru = dist;
+  float dx = 1e-4f;
+
+  for(int countdown = 50; ; countdown--)
+  {
+    float x = ca * ru, y = sa * ru;
+    if(!ls_eval_coord_chain(p, &x, &y)) { x = LS_GEOM_SENTINEL * ca * ru;
+                                          y = LS_GEOM_SENTINEL * sa * ru; }
+    const float rd = _autoscale_residual(p, max_x, max_y, x, y);
+    /* Upstream's NEWTON_EPS * 100. */
+    if(rd > -1e-3f && rd < 1e-3f) return ru;
+    if(!countdown) return -1.f;   /* e.g. an ultrawide fisheye corner extending to infinity */
+
+    float x1 = ca * (ru + dx), y1 = sa * (ru + dx);
+    if(!ls_eval_coord_chain(p, &x1, &y1)) { x1 = LS_GEOM_SENTINEL * ca * (ru + dx);
+                                            y1 = LS_GEOM_SENTINEL * sa * (ru + dx); }
+    const float rd1 = _autoscale_residual(p, max_x, max_y, x1, y1);
+
+    /* Too close to tell apart in this precision: widen the probe rather than divide by
+     * something that is mostly rounding. */
+    if(LS_FABS(rd1 - rd) < 1e-5f) { dx *= 2.f; continue; }
+
+    ru -= rd / ((rd1 - rd) / dx);
+  }
+}
+
+float ls_modifier_autoscale(const ls_modifier_t *mod)
+{
+  if(!mod) return 1.f;
+
+  /* TCA moves each channel's radius slightly past the green one the frame was measured on,
+   * so upstream reserves a flat permille for it. It is a subpixel callback, not a
+   * coordinate one, and so is not part of the transform measured below. */
+  const float subpixel_scale = (mod->enabled & LS_ENABLE_TCA) ? 1.001f : 1.f;
+  if(!(mod->enabled & (LS_ENABLE_DISTORTION | LS_ENABLE_GEOMETRY | LS_ENABLE_SCALE)))
+    return subpixel_scale;
+
+  ls_eval_t p;
+  if(!ls_eval_from_modifier(mod, &p)) return subpixel_scale;
+
+  const float w = mod->width, h = mod->height;
+  const float max_x = w * 0.5f * mod->norm_scale;
+  const float max_y = h * 0.5f * mod->norm_scale;
+
+  /*  3 2 1
+   *  4   0     the four edge midpoints and the four corners
+   *  5 6 7  */
+  const float corner = atanf(h / w);
+  const float pi = 3.14159265f;
+  const float angles[8] = { 0.f,          corner,
+                            pi / 2.f,     pi - corner,
+                            pi,           pi + corner,
+                            3.f * pi / 2.f, 2.f * pi - corner };
+  const float diag = sqrtf(w * w + h * h) * 0.5f * mod->norm_scale;
+  const float dists[8] = { max_x, diag, max_y, diag, max_x, diag, max_y, diag };
+
+  float scale = 0.01f;
+  for(int i = 0; i < 8; i++)
+  {
+    const float landed = _autoscale_distance(&p, cosf(angles[i]), sinf(angles[i]),
+                                             dists[i], max_x, max_y);
+    if(landed <= 0.f) continue;   /* not found; this point cannot raise the maximum */
+    const float point_scale = dists[i] / landed;
+    if(point_scale > scale) scale = point_scale;
+  }
+
+  /* "1 permille is our limit of accuracy (in rare cases, we may be even worse, depending on
+   * what happens between the test points), so assure that we really have no black borders
+   * left." -- upstream, and it is right: the eight points do not bound what happens between
+   * them. */
+  scale *= 1.001f;
+  scale *= subpixel_scale;
+
+  return mod->reverse ? 1.f / scale : scale;
+}
+
 int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
 {
   if(!mod || !out) return 0;
