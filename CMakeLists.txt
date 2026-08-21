@@ -31,6 +31,12 @@ if(LENSSERIOUS_DB)
 endif()
 
 option(LENSSERIOUS_TESTS "Build the lensfun parity harness" ON)
+# Every parity, oracle and benchmark target needs liblensfun, and the whole point of this
+# repository's CI is that they RUN. Finding lensfun is therefore optional for a developer
+# (who may not have it) and mandatory in CI: without this, a missing dependency degrades to
+# "configured fine, built nothing", and the failure surfaces later as a missing binary
+# rather than as the missing package it actually is.
+option(LENSSERIOUS_REQUIRE_LENSFUN "Fail configuration if liblensfun is not found" OFF)
 if(LENSSERIOUS_TESTS)
   enable_testing()
 
@@ -55,6 +61,13 @@ if(LENSSERIOUS_TESTS)
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
     pkg_check_modules(LENSFUN IMPORTED_TARGET lensfun)
+  endif()
+  if(NOT LENSFUN_FOUND AND LENSSERIOUS_REQUIRE_LENSFUN)
+    message(FATAL_ERROR
+            "liblensfun was requested (LENSSERIOUS_REQUIRE_LENSFUN=ON) but pkg-config "
+            "cannot find it. Note that lensfun.pc requires glib-2.0, so libglib2.0-dev "
+            "must be installed as well -- without it the module resolves as not-found "
+            "with no mention of lensfun itself.")
   endif()
   if(LENSFUN_FOUND)
     add_executable(parity_lensfun tests/parity_lensfun.c)

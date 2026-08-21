@@ -1,13 +1,46 @@
 name: CI
 on: [push, pull_request, workflow_dispatch]
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
   parity:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
-      - name: Install lensfun (library + database)
-        run: sudo apt-get update && sudo apt-get install -y liblensfun-dev liblensfun-data-v1 pkg-config cmake ninja-build
+
+      # libglib2.0-dev is not optional despite not being a lensfun package: lensfun.pc
+      # declares Requires: glib-2.0, so without it pkg_check_modules reports lensfun
+      # itself as not found, and every parity target is silently skipped.
+      # clang provides the offline OpenCL compilation the kernel syntax test needs.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            liblensfun-dev liblensfun-data-v1 libglib2.0-dev libsqlite3-dev \
+            pkg-config cmake ninja-build clang
+
+      # LENSSERIOUS_REQUIRE_LENSFUN turns a missing dependency into a configuration
+      # failure naming the package, instead of a green build that tests nothing.
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLENSSERIOUS_REQUIRE_LENSFUN=ON
+
       - name: Build
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
-      - name: Parity against the full database
-        run: ./build/parity_lensfun
+        run: cmake --build build
+
+      # The full suite, not one binary: parity, the database round-trip and field-exact
+      # comparison, the fuzzy-match oracle, and the offline OpenCL compilation. The
+      # database tests rebuild lenses.db from the system XML first, so this also covers
+      # the importer.
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
+
+      - name: Benchmark
+        working-directory: build
+        run: ./bench_lensfun lenses.db 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"

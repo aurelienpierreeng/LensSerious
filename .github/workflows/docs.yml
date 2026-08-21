@@ -69,7 +69,10 @@ jobs:
           tar xzf doxygen.tar.gz
           sudo make -C "doxygen-${V}" install
           rm -rf doxygen.tar.gz "doxygen-${V}"
-          test "$(doxygen --version)" = "$V"
+          # `doxygen --version` prints the number followed by the release's git hash, so
+          # compare the first field only.
+          got="$(doxygen --version | cut -d' ' -f1)"
+          test "$got" = "$V" || { echo "got doxygen $got, expected $V"; exit 1; }
 
       # doc/doxygen-awesome-css is a submodule and the site is unstyled without it.
       - name: Checkout

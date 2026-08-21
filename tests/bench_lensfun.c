@@ -132,6 +132,13 @@ int main(int argc, char **argv)
   printf("bench: %s, %dx%d (%.1f Mpx), single-threaded\n", model, W, H, W * (double)H / 1e6);
   printf("  %-34s %10s %10s %s\n", "", "lensfun", "LensSerious", "");
 
+  /* ======================================================================
+   * PART ONE: getting the calibration data. Paid once per lens, on the CPU,
+   * whatever the pixels are processed on.
+   * ====================================================================== */
+
+  printf("\n  getting the calibration data\n");
+
   /* --- 1. getting a database at all ------------------------------------- */
 
   double t = now_ms();
@@ -212,6 +219,19 @@ int main(int argc, char **argv)
                      LS_ENABLE_DISTORTION | LS_ENABLE_TCA | LS_ENABLE_VIGNETTING);
   const double t_ls_init = (now_ms() - t) / INITS;
   row("resolve at focal/aperture", t_lf_init, t_ls_init, "ms");
+
+  /* Open + find + resolve: everything between "I have a filename and some EXIF" and "I
+   * can correct a pixel". This is the number a caller actually waits for, and the only
+   * one of the three that is dominated by a term LensSerious does not have at all. */
+  const double t_lf_data = t_lf_load + t_lf_find + t_lf_init;
+  const double t_ls_data = t_ls_open + t_ls_find + t_ls_init;
+  row("  = open + find + resolve", t_lf_data, t_ls_data, "ms");
+
+  /* ======================================================================
+   * PART TWO: processing the pixels. Paid per image, and the part a GPU can take.
+   * ====================================================================== */
+
+  printf("\n  processing the pixels (%.1f Mpx)\n", W * (double)H / 1e6);
 
   /* --- 4. the geometry map, the whole frame ----------------------------- */
 
@@ -415,8 +435,8 @@ int main(int argc, char **argv)
 
   /* --- what a session actually pays ------------------------------------- */
 
-  const double lf_session = t_lf_load + t_lf_find + t_lf_init + t_lf_map + t_lf_vig;
-  const double ls_session = t_ls_open + t_ls_find + t_ls_init + t_ls_map + t_ls_vig;
+  const double lf_session = t_lf_data + t_lf_map + t_lf_vig;
+  const double ls_session = t_ls_data + t_ls_map + t_ls_vig;
   printf("\n");
   row("one image, cold start", lf_session, ls_session, "ms");
   printf("  %-34s %10.4f %10.4f ms   %8.1fx\n", "one more image, warm",

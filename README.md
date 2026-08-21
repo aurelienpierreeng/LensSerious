@@ -134,42 +134,99 @@ the best is kept — a shared machine only ever makes a measurement slower, so t
 the closest thing to the cost of the code. Absolute numbers still drift a few percent
 between sessions; the ratios are what to read.
 
-| single-threaded | lensfun | LensSerious | |
-|---|---|---|---|
-| open the database | 103.7 ms | **0.28 ms** | 370× faster |
-| find the lens (fuzzy) | 0.031 ms | 0.17 ms | 5× slower |
-| resolve at focal/aperture | 0.5 µs | 0.04 µs | 12× faster |
-| build the whole geometry map | 299.6 ms | 295.0 ms | **1.0× — no faster** |
-| apply vignetting, whole frame | 70.8 ms | **48.3 ms** | 1.5× faster |
-| one image, cold start | 474.2 ms | **343.8 ms** | 1.4× |
-| one more image, warm | 370.5 ms | **343.3 ms** | 1.1× |
+The two halves are separated below because they behave completely differently, and averaging
+them into one "how fast is it" number hides the only result that matters. Getting the
+calibration data is where LensSerious wins by two orders of magnitude and always will.
+Processing the pixels is where it is *level with lensfun* on a CPU — the win there is
+structural, and it is [further down](#readme-fused).
 
-Two caveats on the map row. It is **1.0× — no faster**, and that is worth stating plainly:
-the 278 ms quoted at the top was always *lensfun's* cost, and closed-form C pays essentially
-the same to push six floats per pixel through memory. And the whole table is built with this
-project's default flags — **a consumer's flags matter more than anything in this library**.
-The same map is 286 ms at plain `-O3`, 217 ms with `-march=native`, and 103 ms with
-`-ffast-math`. Ansel builds with the last, so its map costs ~100 ms, not ~300. (That also
-means its CPU results are no longer bit-identical to its GPU ones; see
+### Getting the calibration data
+
+Paid on the CPU whatever the pixels are processed on: open a database, resolve a free-text
+lens name, then resolve that lens at the shot's focal and aperture.
+
+| | lensfun | LensSerious | |
+|---|---|---|---|
+| open the database | 101.7 ms | **0.18 ms** | 576× faster |
+| find the lens (fuzzy) | 0.031 ms | 0.174 ms | **5.5× slower** |
+| resolve at focal/aperture | 0.44 µs | ~0.03 µs | >10× faster |
+| **= open + find + resolve** | **101.75 ms** | **0.35 ms** | **289× faster** |
+
+The total is the row worth reading, and it is 289× because of one term. lensfun's 101.7 ms
+is almost entirely the XML parse: it reads and DOM-parses the whole upstream database on
+open, so the first lens costs a tenth of a second before any lens has been looked at.
+LensSerious opens an SQLite file that was already parsed offline, `mmap`s it read-only and
+immutable, and reads what the query touches — 0.18 ms.
+
+That is also why the fuzzy match being **5.5× slower is not a defect worth fixing**. It is
+0.174 ms against a 101.7 ms parse: even 20× slower matching would be invisible next to the
+term it replaced. It is the honest number and it stays in the table, but the useful
+comparison is the total, not the row. (It got there from 2.89 ms — the three approaches that
+did *not* work are in [the maintainer's log](doc/maintainers.md#log-matcher).)
+
+Two structural consequences follow from that row, and they are the actual reason for the
+rewrite:
+
+- lensfun's cost is per *process*, so it is paid again by every worker, and it scales with
+  the size of the upstream database rather than with the number of lenses used. LensSerious'
+  is per *query*.
+- Because the file is immutable and lock-free, that 0.35 ms is also what it costs from
+  **any** thread concurrently, with no mutex and no shared handle.
+
+### Processing the pixels
+
+Paid per image, and the part a GPU can take.
+
+| single-threaded, 24 Mpx | lensfun | LensSerious | |
+|---|---|---|---|
+| build the whole geometry map | 296.0 ms | 293.0 ms | **1.0× — no faster** |
+| apply vignetting, whole frame | 71.8 ms | **47.6 ms** | 1.5× faster |
+
+The map row is **1.0×**, and that is worth stating plainly rather than burying: the ~300 ms
+was always *lensfun's* cost, and closed-form C pays essentially the same to push six floats
+per pixel through memory. Vignetting is 1.5× only because upstream leaves three divides and
+a vectorisation-blocking branch per pixel on the table; the arithmetic is the same
+arithmetic.
+
+**A consumer's compiler flags matter more than anything in this library.** The same map is
+286 ms at plain `-O3`, 217 ms with `-march=native`, and 103 ms with `-ffast-math`. Ansel
+builds with the last, so its map costs ~100 ms, not ~300. (That also means its CPU results
+are no longer bit-identical to its GPU ones; see
 [Fused evaluation](doc/fused-evaluation.md#fused-exactness).)
 
-### In parallel
+#### In parallel
 
 A pixel pipeline runs the per-pixel stages across threads, so they are measured that way
 too. Rows are independent on both sides — lensfun's modifier is const during apply and
 writes only the caller's buffer, which is what lets Ansel parallelise it — so this is the
 same work, not one library's threading model against another's.
 
-| 8 threads | lensfun | LensSerious | |
+| 8 threads, 24 Mpx | lensfun | LensSerious | |
 |---|---|---|---|
-| build the whole geometry map | 103.7 ms | **83.8 ms** | 1.2× |
-| apply vignetting, whole frame | 40.7 ms | 41.9 ms | 1.0× |
-| scaling vs. its own 1 thread | 2.84× | 3.51× | |
+| build the whole geometry map | 91.7 ms | **80.7 ms** | 1.1× |
+| apply vignetting, whole frame | 32.2 ms | 33.3 ms | 1.0× |
+| scaling vs. its own 1 thread | 3.23× | 3.63× | |
 
-Neither scales linearly, and vignetting converges to ~41 ms for both: 732 MB read and
-written in 0.041 s is about 18 GB/s, which is the memory bus rather than either library. It
+Neither scales linearly, and vignetting converges to ~33 ms for both: 732 MB read and
+written in 0.033 s is about 22 GB/s, which is the memory bus rather than either library. It
 is also why the 1.5× single-threaded advantage disappears — LensSerious is already close to
 the ceiling with one thread.
+
+**This is the finding, not a disappointment.** Once both libraries are bandwidth-bound
+moving the same map through the same memory, no amount of arithmetic wins. The way past it
+is to stop moving the map.
+
+### One image, end to end
+
+| | lensfun | LensSerious | |
+|---|---|---|---|
+| one image, cold start | 473.3 ms | **343.6 ms** | 1.4× |
+| one more image, warm | 369.8 ms | **343.1 ms** | 1.1× |
+
+The gap between the two rows is the whole database story: 103 ms of it is lensfun's XML
+parse, and it disappears from the second image because that cost is per-process. The warm
+row — 1.1× — is what a batch export actually converges to on a CPU with the map, and it is
+the honest steady-state number for this library as a drop-in replacement.
 
 ## The map, versus never building one  {#readme-fused}
 
@@ -185,17 +242,22 @@ MB written by the map pass, 549 MB read back by the resampler.
 
 | correct + resample, 24 Mpx | 1 thread | 2 | 4 | 8 |
 |---|---|---|---|---|
-| lensfun: map, then resample | 764 ms | 416 | 235 | 238 |
-| LensSerious: map, then resample | 742 ms | 403 | 229 | 215 |
-| LensSerious: **fused, no map** | 866 ms | 447 | 227 | **169** |
-| fused vs. lensfun | 0.88× | 0.93× | 1.04× | **1.41×** |
+| lensfun: map, then resample | 765 ms | 355 | 237 | 236 |
+| LensSerious: map, then resample | 744 ms | 347 | 229 | 218 |
+| LensSerious: **fused, no map** | 874 ms | 438 | 227 | **174** |
+| fused vs. lensfun | 0.88× | 0.81× | 1.04× | **1.35×** |
 
 **Fusing is a loss until four threads and a win after**, and the crossover is the point. With
 one thread the work is latency-bound: two tight loops each optimise and prefetch better than
 one fused loop that interleaves evaluation with scattered reads. With eight, the two-pass
-form saturates the memory bus and stops scaling — lensfun goes 235 → 238 ms from four threads
-to eight, gaining nothing — while the fused pass has no map traffic to saturate on and keeps
+form saturates the memory bus and stops scaling — lensfun goes 237 → 236 ms from four threads
+to eight, gaining *nothing* — while the fused pass has no map traffic to saturate on and keeps
 scaling.
+
+(That table is best-of-three with the thread counts interleaved rather than swept in order.
+Run as a plain sweep it reports 1.1× at eight threads instead of 1.35×, because the low-thread
+runs heat the machine first and the memory-bound row degrades more than the compute-bound one.
+The ordering is part of the measurement.)
 
 That is the same effect the GPU shows, at the other end of the scale: a device with thousands
 of threads is so far past the crossover that not building the map is worth 165× (below).

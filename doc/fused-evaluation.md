@@ -38,10 +38,15 @@ resampler over a 24 Mpx frame (`tests/bench_lensfun.c`), all three producing the
 
 | correct + resample | 1 thread | 2 | 4 | 8 |
 |---|---|---|---|---|
-| lensfun: map, then resample | 764 ms | 416 | 235 | 238 |
-| LensSerious: map, then resample | 742 ms | 403 | 229 | 215 |
-| LensSerious: **fused, no map** | 866 ms | 447 | 227 | **169** |
-| fused vs. lensfun | 0.88× | 0.93× | 1.04× | **1.41×** |
+| lensfun: map, then resample | 765 ms | 355 | 237 | 236 |
+| LensSerious: map, then resample | 744 ms | 347 | 229 | 218 |
+| LensSerious: **fused, no map** | 874 ms | 438 | 227 | **174** |
+| fused vs. lensfun | 0.88× | 0.81× | 1.04× | **1.35×** |
+
+@note Best of three passes with the thread counts **interleaved**, not swept in order. Swept,
+the same binary reports 1.1x at eight threads: the low-thread passes heat the machine, and
+the two-pass row -- being memory-bound -- loses more to the lower clock than the fused one
+does. Measuring a ratio at one thread count in isolation is not enough here.
 
 Fusing **loses** below four threads and wins above, crossing over at four:
 
@@ -49,7 +54,7 @@ Fusing **loses** below four threads and wins above, crossing over at four:
   well; one fused loop interleaves coordinate evaluation with scattered source reads, and
   neither half runs at its best.
 - With eight, the two-pass form saturates the memory bus and stops scaling — lensfun goes
-  235 ms to 238 ms from four threads to eight, gaining *nothing* — while the fused pass has
+  237 ms to 236 ms from four threads to eight, gaining *nothing* — while the fused pass has
   no map traffic to saturate on and keeps scaling.
 
 A GPU sits so far past that crossover that the question does not arise. A CPU sits on either
