@@ -42,6 +42,14 @@ defaults:
   run:
     shell: bash
 
+env:
+  # doc/header.html and doc/footer.html are GENERATED files (doxygen -w html), and the
+  # markers Doxygen substitutes into them change between releases: 1.9.8, which is what
+  # ubuntu-latest's apt ships, leaves $PROJECT_ICON and $COPY_CLIPBOARD unreplaced in the
+  # output and warns about three Doxyfile tags it does not know. So the version is pinned
+  # rather than taken from the distribution. Regenerate the two templates if you bump it.
+  DOXYGEN_VERSION: "1.12.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -50,7 +58,18 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Install deps
-        run: sudo apt-get -y install doxygen graphviz
+        run: sudo apt-get -y install graphviz
+
+      - name: Install Doxygen ${{ env.DOXYGEN_VERSION }}
+        run: |
+          set -euo pipefail
+          V="${DOXYGEN_VERSION}"
+          curl -fsSL -o doxygen.tar.gz \
+            "https://github.com/doxygen/doxygen/releases/download/Release_${V//./_}/doxygen-${V}.linux.bin.tar.gz"
+          tar xzf doxygen.tar.gz
+          sudo make -C "doxygen-${V}" install
+          rm -rf doxygen.tar.gz "doxygen-${V}"
+          test "$(doxygen --version)" = "$V"
 
       # doc/doxygen-awesome-css is a submodule and the site is unstyled without it.
       - name: Checkout
