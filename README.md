@@ -179,8 +179,8 @@ rewrite:
     but each worker needs to lock an app-wide mutex to protect global states, and possibly
     wait for other threads to release the lock.
 - Because the LensSerious database is immutable, stateless and lock-free, that 0.35 ms is what it costs from
-  **any** thread concurrently at each query, with no mutex, no shared handle, so it's not only much
-  faster: parallel accesses 
+  **any** thread concurrently at each query, with no mutex, no shared handle. Per *process*, it is much faster,
+  per *application*, it is marginally slower to fetch lens data but doesn't wait on other threads.
 
 ### Processing the pixels
 
