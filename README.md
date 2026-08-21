@@ -133,13 +133,13 @@ Head-to-head against liblensfun 0.3.4, 24 Mpx, single-threaded, both sides on th
 
 | | lensfun | LensSerious | |
 |---|---|---|---|
-| open the database | 86.1 ms | **0.168 ms** | 512× faster |
-| find the lens (fuzzy) | 0.030 ms | 2.88 ms | **96× slower** |
+| open the database | 99.2 ms | **0.261 ms** | 380× faster |
+| find the lens (fuzzy) | 0.038 ms | 0.28 ms | 7× slower |
 | resolve at focal/aperture | 0.5 µs | 0.04 µs | 13× faster |
-| build the whole geometry map | 269.3 ms | 273.8 ms | **1.0× — no faster** |
-| apply vignetting, whole frame | 65.0 ms | **43.3 ms** | 1.5× faster |
-| one image, cold start | 420.5 ms | **320.1 ms** | 1.3× |
-| one more image, warm | 334.3 ms | **317.1 ms** | 1.1× |
+| build the whole geometry map | 288.5 ms | 293.4 ms | **1.0× — no faster** |
+| apply vignetting, whole frame | 71.4 ms | **49.3 ms** | 1.4× faster |
+| one image, cold start | 459.2 ms | **343.2 ms** | 1.3× |
+| one more image, warm | 359.9 ms | **342.7 ms** | 1.1× |
 
 **The geometry map is not faster on the CPU**, and that is worth stating plainly: the 278 ms
 quoted above was always *lensfun's* cost, and closed-form C pays essentially the same to
@@ -148,11 +148,22 @@ dispatch inside the per-pixel evaluator is loop-invariant but the compiler will 
 it, so the generated code is 10 scalar divides and 10 scalar square roots. Real work left on
 the table, and the row that matters least, because on a GPU that map is never built.
 
-The **fuzzy lookup** is a database losing to an in-memory search: ~4700 rows through a
-b-tree against structs already in RAM. Once per image against 270 ms of map building. An
-inverted token index was built for it and *measured*, and is not in the code because it made
-things worse (5.13 ms against 2.88 ms, identical agreement): model tokens — `mm`, `f`, `ed`,
-`vr`, the focal digits — are not selective.
+The **fuzzy lookup** was 2.89 ms — 96× slower — until it was profiled. It was not the
+database losing to an in-memory search, it was two mistakes. It scored every one of the
+~4700 catalogue names on every lookup, where lensfun rejects almost every candidate on two
+float compares before touching a string; and `lens_name` was indexed on `norm` and nothing
+else, so the query gathering candidates scanned the whole table anyway.
+
+The fix is to score fewer names, not to score faster: `lens_token` and `token_df` let a
+lookup ask which of the *query's* tokens is rarest — `16` or `nikkor` reaches tens of lenses
+where `mm` or `f` reaches thousands — and gather only those, falling back to the full scan
+if that finds nothing, so the answer never depends on the pruning. 2.89 ms → 0.19 ms, with
+agreement unchanged at 99.0%.
+
+Two things were tried, measured, and are deliberately *not* in the code: gathering on **all**
+the query's tokens (no better than the scan it replaces), and hashing the tokens to compare
+them faster (moved nothing — the per-comparison cost was already ~5 ns; there were simply
+half a million comparisons).
 
 **Vignetting** was 1.8× *slower* until the divides were counted. Three causes, worth
 recording because two of them are not about arithmetic: the half-diagonal coordinate system
@@ -207,7 +218,7 @@ Where the design wins is not arithmetic, it is architecture:
 | vignetting (pa) | ported; 4054 configurations at ≤ 3e-6 |
 | projection conversion (fisheye ↔ rectilinear, orthographic, stereographic, equisolid, thoby) | ported and verified; declines for lenses carrying `<real-focal-length>` data, and for panoramic/equirectangular, which are not radially expressible — 42 configurations |
 | database (XML → SQLite) + stateless lock-free reader | done; whole database verified field-by-field against liblensfun |
-| fuzzy matching | done; **99.0%** agreement with liblensfun's own top pick over the whole database (100% verbatim, 99.5% maker-stripped) |
+| fuzzy matching | done; **99.0%** agreement with liblensfun's own top pick over the whole database (100% verbatim, 99.5% maker-stripped), at 0.19 ms a lookup |
 | OpenCL | evaluators compile as OpenCL C from the same header; Ansel consumes them per work-item |
 | upstream sync (`version_2` conversion tooling) | not started |
 | native XML reader (dropping liblensfun from the importer) | not started |
