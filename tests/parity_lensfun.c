@@ -26,17 +26,25 @@
  * envelope on real raws. */
 unsigned int _ls_no_cpu_features(void) __asm__("_Z23_lf_detect_cpu_featuresv");
 unsigned int _ls_no_cpu_features(void) { return 0; }
+/* ... but whether that interposition actually BINDS is a property of how the distribution
+ * built liblensfun -- hidden visibility or -Bsymbolic keep the call internal, and there is
+ * no way to ask. It silently did not bind on ubuntu-24.04, where the harness then compared
+ * against the SSE path and reported upstream's own 0.78 px approximation as a LensSerious
+ * failure. Nothing here may depend on it having worked: row assertions are made against
+ * upstream's WIDTH-1 answer, which never enters the SSE path, and the row-vs-width-1
+ * deviation of upstream itself is measured and reported rather than assumed. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define TOL_GEOMETRY_PX 0.01f   /* width-1 grid: validates semantics vs upstream's scalar math */
-/* Full rows go through upstream's SSE path, whose sqrt is rcp(rsqrt(r2)) -- two chained
- * 12-bit approximations, no Newton step (mod-coord-sse.cpp). Upstream disagrees with its
- * own scalar math by up to ~0.2 px at row ends; rows are therefore held to upstream's own
- * approximation bound, not to exactness. */
-#define TOL_GEOMETRY_ROW(ref) TOL_GEOMETRY_PX
+#define TOL_GEOMETRY_PX 0.01f   /* validates semantics vs upstream's SCALAR math */
+
+/* How many positions along a row are held to upstream's scalar answer. The row exists to
+ * catch accumulator drift, which grows towards the end, so the sampling is even and always
+ * includes the last pixel. Every sample costs one width-1 liblensfun call; comparing all
+ * ~4000 of them would multiply the harness's runtime for no additional coverage. */
+#define ROW_PROBES 64
 #define TOL_VIGNETTING  1e-4f   /* max |Δ| on the multiplier */
 
 static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
@@ -133,11 +141,14 @@ int main(int argc, char **argv)
     return 2;
   }
 
-  const lfLens **lenses = lf_db_get_lenses(ldb);
+  const lfLens *const *lenses = lf_db_get_lenses(ldb);
   int total = 0, compared = 0, skipped_geometry = 0, failed = 0;
   int vig_compared = 0, vig_failed = 0;
   float worst_px = 0.f, worst_vig = 0.f;
   char worst_name[256] = "", worst_vig_name[256] = "";
+  /* Upstream measured against itself: its row walk against its own width-1 answer. */
+  float upstream_row_dev = 0.f;
+  char upstream_name[256] = "";
 
   for(int li = 0; lenses && lenses[li]; li++)
   {
@@ -208,15 +219,43 @@ int main(int argc, char **argv)
           const int rw = W < 4096 ? W : 4096;
           lf_modifier_apply_subpixel_geometry_distortion(ref, 0.f, H * 0.5f, rw, 1, rowa);
           ls_modifier_apply_subpixel_geometry(&mod, 0.f, H * 0.5f, rw, 1, rowb);
-          for(int k = 0; k < rw * 6; k++)
+
+          /* The gate. Upstream's width-1 call is its scalar math by construction -- the SSE
+           * variants only engage for a run of pixels -- so comparing against it asserts the
+           * semantics whatever upstream chose to do for the row itself. */
+          for(int probe = 0; probe < ROW_PROBES; probe++)
           {
-            const float d = fabsf(rowa[k] - rowb[k]);
-            if(d > worst_px)
+            const int i = (rw <= ROW_PROBES) ? probe
+                                             : (int)((probe + 1) * (long)(rw - 1) / ROW_PROBES);
+            if(i >= rw) break;
+            float scalar[6];
+            lf_modifier_apply_subpixel_geometry_distortion(ref, (float)i, H * 0.5f, 1, 1, scalar);
+            for(int c = 0; c < 6; c++)
             {
-              worst_px = d;
-              snprintf(worst_name, sizeof(worst_name), "%s @ %.1fmm ROW k %d", lf->Model, focal, k);
+              const float d = fabsf(scalar[c] - rowb[i * 6 + c]);
+              if(d > worst_px)
+              {
+                worst_px = d;
+                snprintf(worst_name, sizeof(worst_name), "%s @ %.1fmm ROW x %d", lf->Model,
+                         focal, i);
+              }
+              if(d > TOL_GEOMETRY_PX) failed++;
             }
-            if(d > TOL_GEOMETRY_ROW(rowa[k])) failed++;
+            /* Upstream against upstream: how far its own row walk has drifted from its own
+             * scalar answer. Not a verdict on anything in this library -- it is the size of
+             * the approximation every lensfun-corrected render already carries, and it is
+             * reported so that a run on a machine where the scalar interposition did bind
+             * is visibly distinguishable from one where it did not. */
+            for(int c = 0; c < 6; c++)
+            {
+              const float d = fabsf(scalar[c] - rowa[i * 6 + c]);
+              if(d > upstream_row_dev)
+              {
+                upstream_row_dev = d;
+                snprintf(upstream_name, sizeof(upstream_name), "%s @ %.1fmm x %d", lf->Model,
+                         focal, i);
+              }
+            }
           }
         }
         /* Border + centre + diagonal samples: distortion is worst at corners. */
@@ -301,9 +340,15 @@ int main(int argc, char **argv)
 
   printf("parity: %d lenses total, %d geometry-compared, %d skipped (projection not yet"
          " offered), %d vignetting-compared\n", total, compared, skipped_geometry, vig_compared);
-  printf("parity: worst geometry delta %.6f px (%s); grid tol %.3f px, rows held to upstream's"
-         " SSE approximation envelope -> %s\n",
+  printf("parity: worst geometry delta %.6f px (%s); everything held to upstream's SCALAR"
+         " answer at %.3f px -> %s\n",
          worst_px, worst_name, TOL_GEOMETRY_PX, failed ? "FAIL" : "pass");
+  printf("parity: upstream's own row walk deviates %.6f px from its own width-1 answer (%s)"
+         " -- %s\n", upstream_row_dev, upstream_name[0] ? upstream_name : "none",
+         upstream_row_dev > TOL_GEOMETRY_PX
+             ? "liblensfun ran its SSE path here; that figure is the approximation every"
+               " lensfun-corrected render carries, and is not a verdict on this library"
+             : "liblensfun ran its scalar path here");
   printf("parity: worst vignetting delta %.6f (%s), tolerance %g -> %s\n",
          worst_vig, worst_vig_name, TOL_VIGNETTING, vig_failed ? "FAIL" : "pass");
   if(failed || vig_failed)
