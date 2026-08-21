@@ -619,7 +619,12 @@ static float _score_tokens(const ls_tokens_t *pat, const ls_tokens_t *cand)
          * hint. Anything shorter than three characters is noise, not a hint. The lengths
          * are already known, so this costs no strlen(). */
         const int lmin = (li < lj) ? li : lj;
-        if(lmin >= 3 && memcmp(pat->t[i], cand->t[j], (size_t)lmin) == 0)
+        /* First byte before the call. Without it memcmp() runs for EVERY pair of tokens
+         * that are not equal -- ~120 calls per catalogue name -- and prefix matches are
+         * rare, so almost all of them return on their first byte anyway. Doing that compare
+         * inline is the difference between ~700 ns and ~200 ns per name. */
+        if(lmin >= 3 && pat->t[i][0] == cand->t[j][0]
+           && memcmp(pat->t[i] + 1, cand->t[j] + 1, (size_t)(lmin - 1)) == 0)
           s = 0.5f * (float)lmin / (float)((li > lj) ? li : lj);
       }
       if(s > best)
