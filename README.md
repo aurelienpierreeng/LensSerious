@@ -133,26 +133,62 @@ Head-to-head against liblensfun 0.3.4, 24 Mpx, single-threaded, both sides on th
 
 | | lensfun | LensSerious | |
 |---|---|---|---|
-| open the database | 88.2 ms | **0.166 ms** | 531× faster |
-| find the lens (fuzzy) | 0.028 ms | 3.15 ms | **112× slower** |
-| resolve at focal/aperture | 0.4 µs | 0.04 µs | 11× faster |
-| build the whole geometry map | 271.8 ms | 268.5 ms | **1.0× — no faster** |
-| apply vignetting, whole frame | 66.1 ms | 117.3 ms | **1.8× slower** |
-| one image, cold start | 426 ms | 389 ms | 1.1× |
-| one more image, warm | 338 ms | 386 ms | 0.9× |
+| open the database | 86.1 ms | **0.168 ms** | 512× faster |
+| find the lens (fuzzy) | 0.030 ms | 2.88 ms | **96× slower** |
+| resolve at focal/aperture | 0.5 µs | 0.04 µs | 13× faster |
+| build the whole geometry map | 269.3 ms | 273.8 ms | **1.0× — no faster** |
+| apply vignetting, whole frame | 65.0 ms | **43.3 ms** | 1.5× faster |
+| one image, cold start | 420.5 ms | **320.1 ms** | 1.3× |
+| one more image, warm | 334.3 ms | **317.1 ms** | 1.1× |
 
-**Read that honestly: the closed forms are not faster than lensfun on the CPU.** The 278 ms
-quoted above was always *lensfun's* cost, and plain C pays essentially the same to push six
-floats per pixel through memory. Two rows are slower on purpose:
+**The geometry map is not faster on the CPU**, and that is worth stating plainly: the 278 ms
+quoted above was always *lensfun's* cost, and closed-form C pays essentially the same to
+push six floats per pixel through memory. That loop does not vectorise either — the model
+dispatch inside the per-pixel evaluator is loop-invariant but the compiler will not unswitch
+it, so the generated code is 10 scalar divides and 10 scalar square roots. Real work left on
+the table, and the row that matters least, because on a GPU that map is never built.
 
-- **vignetting**, because `ls_eval_vignette_factor()` is written to be independent per
-  work-item — it recomputes the row term and divides for every pixel — which is what a GPU
-  wants and what keeps one source text for both. On the CPU that trade costs ~51 ms/frame.
-- **the fuzzy lookup**, which is simply a database losing to an in-memory search: ~4700
-  rows through a b-tree against structs already in RAM. It is once per image against 268 ms
-  of map building. An inverted token index was built for it and *measured*, and is not in
-  the code because it made things worse (5.13 ms against 3.15 ms, identical agreement):
-  model tokens — `mm`, `f`, `ed`, `vr`, the focal digits — are not selective.
+The **fuzzy lookup** is a database losing to an in-memory search: ~4700 rows through a
+b-tree against structs already in RAM. Once per image against 270 ms of map building. An
+inverted token index was built for it and *measured*, and is not in the code because it made
+things worse (5.13 ms against 2.88 ms, identical agreement): model tokens — `mm`, `f`, `ed`,
+`vr`, the focal digits — are not selective.
+
+**Vignetting** was 1.8× *slower* until the divides were counted. Three causes, worth
+recording because two of them are not about arithmetic: the half-diagonal coordinate system
+was computed with a divide per axis per pixel (now a folded multiply-and-subtract carried in
+`ls_eval_t`); the row-invariant y term was recomputed per pixel; and a `c == 0` guard —
+which was not upstream behaviour either — was a second conditional that stopped the caller's
+loop vectorising **entirely**, leaving `divss` where there should be `divps`. Removing it and
+splitting the row into fill-then-scale gives four divides per instruction. 117 ms → 43 ms.
+
+## What it costs to reach a GPU
+
+This is where the design claim actually lives, and it is not about arithmetic
+([`tests/bench_opencl.c`](tests/bench_opencl.c), Quadro M2200, 24 Mpx):
+
+| geometry map, 549 MB of coordinates | |
+|---|---|
+| lensfun: build on the CPU | 555.5 ms |
+| lensfun: upload it | 107.8 ms |
+| **lensfun: total to reach the device** | **663.3 ms** |
+| LensSerious: the same map, on the device | 37.0 ms — **17.9×** |
+| LensSerious: evaluated, never stored | 3.4 ms — **196×** |
+
+| vignetting, 366 MB of multipliers | |
+|---|---|
+| **lensfun: total to reach the device** | **317.1 ms** |
+| LensSerious: on the device | 1.7 ms — **187×** |
+
+The CPU build is 555 ms here against 269 ms in the table above. Same single-threaded loop —
+the difference is that this one materialises the whole 549 MB buffer, while the other reuses
+one row. 555 ms is what a GPU pipeline actually pays, because it needs the entire map before
+it can upload any of it.
+
+The middle row is the apples-to-apples comparison: the same buffer, produced the two
+available ways. The last row is the shape production uses, and even that is pessimistic — it
+still launches a kernel over the frame, where inlining the evaluator into the kernel that
+*consumes* the coordinates makes the map disappear altogether.
 
 Where the design wins is not arithmetic, it is architecture:
 
@@ -175,6 +211,8 @@ Where the design wins is not arithmetic, it is architecture:
 | OpenCL | evaluators compile as OpenCL C from the same header; Ansel consumes them per work-item |
 | upstream sync (`version_2` conversion tooling) | not started |
 | native XML reader (dropping liblensfun from the importer) | not started |
+| CPU geometry map vectorisation | **open** — the loop is scalar because the model dispatch inside the per-pixel evaluator is loop-invariant and the compiler will not unswitch it |
+| `<real-focal-length>` interpolation | **open** — would let the last projection cases off the fallback path; the schema already has the table, the importer does not fill it |
 
 ## License
 
