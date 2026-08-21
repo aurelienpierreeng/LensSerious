@@ -329,6 +329,8 @@ int main(int argc, char **argv)
                                    " VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
   sqlite3_stmt *ins_vig = prep(db, "INSERT INTO calib_vignetting(lens_id, ord, model, focal, aperture,"
                                    " distance, t0, t1, t2) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+  sqlite3_stmt *ins_real_focal = prep(db, "INSERT INTO lens_real_focal(lens_id, focal, real_focal)"
+                                          " VALUES (?1, ?2, ?3)");
 
   /* mounts, then their compatibility lists (which reference mounts by name) */
   int n_mounts = 0;
@@ -439,6 +441,20 @@ int main(int argc, char **argv)
         for(int t = 0; t < 3; t++) sqlite3_bind_double(ins_vig, 7 + t, (*c)->Terms[t]);
         step_reset(db, ins_vig);
       }
+
+    /* <real-focal-length>. Rare -- a few dozen lenses -- and load-bearing where it exists:
+     * it is the focal the PROJECTION runs on, and on the Sigma 4.5mm circular fisheye it is
+     * 0.47x the nominal one. Zero entries are dropped here rather than at read time because
+     * upstream skips them when interpolating, so a stored zero is a row nothing can use. */
+    if(lens->CalibRealFocal)
+      for(lfLensCalibRealFocal **c = lens->CalibRealFocal; *c; c++)
+      {
+        if((*c)->RealFocal == 0.f) continue;
+        sqlite3_bind_int64(ins_real_focal, 1, id);
+        sqlite3_bind_double(ins_real_focal, 2, (*c)->Focal);
+        sqlite3_bind_double(ins_real_focal, 3, (*c)->RealFocal);
+        step_reset(db, ins_real_focal);
+      }
   }
 
   /* provenance, so a database can always say where it came from */
@@ -489,6 +505,7 @@ int main(int argc, char **argv)
   sqlite3_finalize(ins_token);
   sqlite3_finalize(ins_lens_mount);
   sqlite3_finalize(ins_dist);
+  sqlite3_finalize(ins_real_focal);
   sqlite3_finalize(ins_tca);
   sqlite3_finalize(ins_vig);
   if(sqlite3_close(db) != SQLITE_OK) die("close output", db);

@@ -16,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define LS_DB_SCHEMA_VERSION 3
+#define LS_DB_SCHEMA_VERSION 4
 
 struct ls_db_t
 {
@@ -262,6 +262,32 @@ static int _fill_calibrations(ls_db_t *db, long long lens_id, ls_lens_t *out)
     if(kind == 0) out->n_dist = n;
     else if(kind == 1) out->n_tca = n;
     else out->n_vig = n;
+  }
+
+  /* <real-focal-length>. Its own query rather than a fourth entry in the table above: it
+   * has no model and no terms, and bending the shared loop around that would cost more than
+   * the six lines it saves. It is also ordered by focal rather than by ord, because the
+   * spline picks neighbours by focal distance and a file written in any other order would
+   * still have to be sorted somewhere. */
+  {
+    sqlite3_stmt *st = NULL;
+    if(sqlite3_prepare_v2(db->sql,
+                          "SELECT focal, real_focal FROM lens_real_focal WHERE lens_id = ?1"
+                          " ORDER BY focal", -1, &st, NULL) != SQLITE_OK)
+    {
+      _db_err(db, "prepare real focal");
+      return -1;
+    }
+    sqlite3_bind_int64(st, 1, lens_id);
+    int n = 0;
+    while(sqlite3_step(st) == SQLITE_ROW && n < LS_MAX_CALIB)
+    {
+      out->real_focal[n].focal = (float)sqlite3_column_double(st, 0);
+      out->real_focal[n].real_focal = (float)sqlite3_column_double(st, 1);
+      n++;
+    }
+    sqlite3_finalize(st);
+    out->n_real_focal = n;
   }
   return 0;
 }

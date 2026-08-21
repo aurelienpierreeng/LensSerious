@@ -74,6 +74,52 @@ static void _spline_insert(spline_t *s, float dist, const void *val)
  * identity for distortion and index<2 of TCA uses focal-domain scaling — ported below
  * exactly as the 0.3.4 code has it (lens.cpp:841): distortion: none; TCA terms 0..1:
  * none (the switch body falls through empty for LINEAR/POLY3 v-terms in 0.3.4). */
+/* <real-focal-length>, interpolated the same way as everything else here: a Catmull-Rom
+ * spline over the four nearest points, an exact match short-circuiting it. The one
+ * difference from the distortion interpolation next door is that there is NO focal scaling
+ * -- upstream's __parameter_scales leaves real-focal alone, and rightly so: it is a length,
+ * not a coefficient whose magnitude tracks 1/focal. */
+static int _interp_real_focal(const ls_lens_t *lens, float focal, float *res)
+{
+  if(lens->n_real_focal == 0) return 0;
+  spline_t s; _spline_init(&s);
+
+  for(int i = 0; i < lens->n_real_focal; i++)
+  {
+    const ls_calib_real_focal_t *c = &lens->real_focal[i];
+    if(c->real_focal == 0.f) continue;   /* upstream skips these outright */
+    const float df = focal - c->focal;
+    if(df == 0.0f) { *res = c->real_focal; return 1; }
+    _spline_insert(&s, df, c);
+  }
+  const ls_calib_real_focal_t *lo = (const ls_calib_real_focal_t *)s.v[1];
+  const ls_calib_real_focal_t *hi = (const ls_calib_real_focal_t *)s.v[2];
+  if(!lo || !hi)
+  {
+    if(lo) { *res = lo->real_focal; return 1; }
+    if(hi) { *res = hi->real_focal; return 1; }
+    return 0;
+  }
+  const ls_calib_real_focal_t *fl = (const ls_calib_real_focal_t *)s.v[0];
+  const ls_calib_real_focal_t *fh = (const ls_calib_real_focal_t *)s.v[3];
+  const float t = (focal - lo->focal) / (hi->focal - lo->focal);
+  *res = _interpolate(fl ? fl->real_focal : FLT_MAX, lo->real_focal, hi->real_focal,
+                      fh ? fh->real_focal : FLT_MAX, t);
+  return 1;
+}
+
+/* Hugin's focal-length convention, as a multiplier on the nominal focal
+ * (modifier.cpp: get_hugin_focal_correction). It is derived from the distortion
+ * coefficients ALREADY interpolated at this focal, not from a separate fit. */
+static float _hugin_focal_correction(const ls_calib_dist_t *dist, int have_dist)
+{
+  if(!have_dist) return 1.f;
+  if(dist->model == LS_DIST_POLY3) return 1.f - dist->terms[0];
+  if(dist->model == LS_DIST_PTLENS)
+    return 1.f - dist->terms[0] - dist->terms[1] - dist->terms[2];
+  return 1.f;
+}
+
 static int _interp_dist(const ls_lens_t *lens, float focal, ls_calib_dist_t *res)
 {
   if(lens->n_dist == 0) return 0;
@@ -274,32 +320,43 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
    * The SHOOTING crop deliberately does not appear: it is already inside norm_scale, and
    * a first version that used a bare focal/12 (fitted on 3:2 lenses alone, where the two
    * happen to coincide) was out by 284 px on a 4:3 compact. */
-  mod->geom_focal = focal * lens->crop_factor * aspect_ratio_correction
+  /* The focal the PROJECTION runs on, which is not always the one engraved on the barrel.
+   * lensfun's geometry callback uses GetRealFocalLength(focal) divided by
+   * get_hugin_focal_correction(focal) (modifier.cpp), and that resolves to three cases:
+   *
+   *   - a lens carrying <real-focal-length> data: GetRealFocalLength returns it and returns
+   *     EARLY, before the hugin multiplication -- so the division does not cancel and the
+   *     geometry focal is real_focal / hugin;
+   *   - a lens without it: GetRealFocalLength multiplies the hugin factor in and the caller
+   *     divides it straight back out, leaving exactly the nominal focal. Measured across
+   *     every fisheye in the database, ratio 1.0000.
+   *
+   * Getting this wrong is not subtle. On the Sigma 4.5mm circular fisheye the geometry
+   * focal is 0.4727x the nominal one, and using the nominal is 28 px out at the CENTRE of
+   * the frame and 135 px at the edge. Carrying the calibration points is what lets those
+   * lenses be corrected at all rather than declined. */
+  float geom_focal_mm = focal;
+  {
+    /* Unconditionally, and deliberately not from mod->dist: upstream derives the hugin
+     * factor from the distortion calibration whether or not the caller asked for
+     * distortion to be corrected, so gating it on the enable flags would change the
+     * projection depending on an unrelated request. */
+    ls_calib_dist_t hugin_dist;
+    const int have_dist = _interp_dist(lens, focal, &hugin_dist);
+    float real_focal = 0.f;
+    if(_interp_real_focal(lens, focal, &real_focal) && real_focal > 0.f)
+      geom_focal_mm = real_focal / _hugin_focal_correction(&hugin_dist, have_dist);
+  }
+
+  mod->geom_focal = geom_focal_mm * lens->crop_factor * aspect_ratio_correction
                     / LS_EVAL_FULL_FRAME_HALF_DIAG_MM;
   mod->geometry_unsupported = (from != to) && !radial;
 
-  /* A projection change is offered where the geometry FOCAL is known to be the nominal
-   * one, which is the whole database except the handful of lenses carrying
-   * <real-focal-length> data.
-   *
-   * lensfun's geometry callback runs on GetRealFocalLength(focal) divided by
-   * get_hugin_focal_correction(focal) (modifier.cpp). Without real-focal data the first
-   * multiplies the hugin factor in and the second divides it straight back out, so the
-   * result is exactly `focal` -- measured across every fisheye in the database, ratio
-   * 1.0000. With real-focal data they do not cancel and the focal becomes
-   * real_focal / hugin, which ls_lens_t does not carry the calibration points to compute.
-   *
-   * Getting that focal wrong is not subtle: on the Sigma 4.5mm circular fisheye, whose
-   * real focal is 4.533 against a nominal 4.5 and whose hugin factor is 2.13, using the
-   * nominal focal is 28 px out at the centre of the frame and 135 px at the edge. So those
-   * lenses fall back instead.
-   *
-   * The composition ORDER is settled and is the one below: lensfun's correction chain is
+  /* The composition ORDER is settled and is the one below: lensfun's correction chain is
    * scale (100), geometry (500), distortion (750, ModifyCoord_Dist_* -- the 250 UnDist_*
    * variants are the reverse direction), then TCA as a subpixel callback after every
    * coordinate callback. An earlier reading of this file's own header suggested the
    * reverse and was wrong. */
-  if(from != to && radial && lens->has_real_focal) mod->geometry_unsupported = 1;
 
   mod->reverse = reverse ? 1 : 0;
 
@@ -315,7 +372,7 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
   }
 
   int enabled = 0;
-  if(from != to && radial && !lens->has_real_focal && focal > 0.f) enabled |= LS_ENABLE_GEOMETRY;
+  if(from != to && radial && focal > 0.f) enabled |= LS_ENABLE_GEOMETRY;
   if((flags & LS_ENABLE_DISTORTION) && _interp_dist(lens, focal, &mod->dist))
     enabled |= LS_ENABLE_DISTORTION;
   if((flags & LS_ENABLE_TCA) && _interp_tca(lens, focal, &mod->tca))

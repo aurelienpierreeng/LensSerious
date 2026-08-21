@@ -12,7 +12,7 @@
 -- translation. That is deliberate: every conversion between the XML's vocabulary and the
 -- evaluator's happens once, offline, where it can be checked, rather than per render.
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 
 CREATE TABLE meta (
   key   TEXT PRIMARY KEY,
@@ -166,13 +166,20 @@ CREATE TABLE token_df (
   PRIMARY KEY (kind, token)
 ) WITHOUT ROWID;
 
--- A focal-length remap a few compacts carry, kept so nothing from upstream is lost even
--- though the evaluators do not consult it yet.
+-- <real-focal-length>: the focal the PROJECTION stage runs on, which is not the one
+-- engraved on the barrel. Only a few dozen lenses carry it and it is load-bearing where
+-- they do -- 0.47x nominal on the Sigma 4.5mm circular fisheye, which is 28 px at the
+-- centre of the frame if the nominal focal is used instead.
+--
+-- WITHOUT ROWID and keyed by (lens_id, focal): the reader fetches a whole lens's points
+-- ordered by focal, which is exactly this key, so the fetch is one contiguous range scan
+-- and needs no separate index. Same reasoning as the calib_* tables.
 CREATE TABLE lens_real_focal (
   lens_id    INTEGER NOT NULL REFERENCES lens(id),
   focal      REAL NOT NULL,
-  real_focal REAL NOT NULL
-);
+  real_focal REAL NOT NULL,
+  PRIMARY KEY (lens_id, focal)
+) WITHOUT ROWID;
 
 -- Lookups are by name, and the calibration fetch is by lens_id. Nothing else is indexed:
 -- an index the reader never uses is bytes every reader pays to mmap.

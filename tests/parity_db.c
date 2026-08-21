@@ -74,6 +74,20 @@ static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
   out->min_focal = lf->MinFocal;
   out->max_focal = lf->MaxFocal;
 
+  /* <real-focal-length>, with the zero entries dropped -- the importer drops them too,
+   * because upstream skips them when interpolating and a stored zero is a row nothing can
+   * use. Both sides must drop them identically or the counts will not match. */
+  if(lf->CalibRealFocal)
+    for(int i = 0; lf->CalibRealFocal[i]; i++)
+    {
+      const lfLensCalibRealFocal *c = lf->CalibRealFocal[i];
+      if(c->RealFocal == 0.f) continue;
+      if(out->n_real_focal >= LS_MAX_CALIB) return -1;
+      out->real_focal[out->n_real_focal].focal = c->Focal;
+      out->real_focal[out->n_real_focal].real_focal = c->RealFocal;
+      out->n_real_focal++;
+    }
+
   if(lf->CalibDistortion)
     for(int i = 0; lf->CalibDistortion[i]; i++)
     {
@@ -133,7 +147,7 @@ static int _same_lens(const ls_lens_t *a, const ls_lens_t *b, const char *name)
     bad = 1;                                                                              \
   }
   CMP(type) CMP(crop_factor) CMP(aspect_ratio) CMP(center_x) CMP(center_y)
-  CMP(min_focal) CMP(max_focal) CMP(n_dist) CMP(n_tca) CMP(n_vig)
+  CMP(min_focal) CMP(max_focal) CMP(n_dist) CMP(n_tca) CMP(n_vig) CMP(n_real_focal)
 #undef CMP
   if(bad) return 0;
 
@@ -186,6 +200,14 @@ static int _same_lens(const ls_lens_t *a, const ls_lens_t *b, const char *name)
     }
     CMPF("tca", i, "focal", a->tca[i].focal, b->tca[i].focal)
     for(int k = 0; k < 6; k++) CMPF("tca", i, "terms", a->tca[i].terms[k], b->tca[i].terms[k])
+  }
+  /* The reader returns these ordered by focal, which is also the order the importer wrote
+   * them in and the order upstream lists them; if that ever stops being true the spline
+   * would still pick the same four neighbours, but the comparison below would not. */
+  for(int i = 0; i < a->n_real_focal; i++)
+  {
+    CMPF("real_focal", i, "focal", a->real_focal[i].focal, b->real_focal[i].focal)
+    CMPF("real_focal", i, "real_focal", a->real_focal[i].real_focal, b->real_focal[i].real_focal)
   }
   for(int i = 0; i < a->n_vig; i++)
   {

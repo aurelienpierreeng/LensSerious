@@ -150,10 +150,16 @@ static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
   out->aspect_ratio = lf->AspectRatio;
   out->center_x = lf->CenterX;
   out->center_y = lf->CenterY;
-  {
-    lfLensCalibRealFocal rf;
-    out->has_real_focal = lf_lens_interpolate_real_focal(lf, lf->MinFocal, &rf) ? 1 : 0;
-  }
+  /* The real-focal points themselves now, not merely whether they exist: they feed the
+   * projection focal rather than gating it. */
+  if(lf->CalibRealFocal)
+    for(int i = 0; lf->CalibRealFocal[i] && out->n_real_focal < LS_MAX_CALIB; i++)
+    {
+      const lfLensCalibRealFocal *c = lf->CalibRealFocal[i];
+      out->real_focal[out->n_real_focal].focal = c->Focal;
+      out->real_focal[out->n_real_focal].real_focal = c->RealFocal;
+      out->n_real_focal++;
+    }
 
   if(lf->CalibDistortion)
     for(int i = 0; lf->CalibDistortion[i] && out->n_dist < LS_MAX_CALIB; i++)

@@ -83,6 +83,9 @@ typedef enum ls_vig_model_t
 typedef struct ls_calib_dist_t { ls_dist_model_t model; float focal; float terms[3]; } ls_calib_dist_t;
 typedef struct ls_calib_tca_t  { ls_tca_model_t  model; float focal; float terms[6]; } ls_calib_tca_t;
 typedef struct ls_calib_vig_t  { ls_vig_model_t  model; float focal, aperture, distance; float terms[3]; } ls_calib_vig_t;
+/** One <real-focal-length> point: the focal engraved on the barrel, and the one the lens
+ * actually has there. They differ by up to a factor of two on fisheyes. */
+typedef struct ls_calib_real_focal_t { float focal; float real_focal; } ls_calib_real_focal_t;
 
 enum { LS_MAX_CALIB = 512 }; /* the densest lens in the 2026 database has ~300 vignetting points */
 
@@ -107,19 +110,20 @@ typedef struct ls_lens_t
   float aspect_ratio;  /**< of the calibration sensor, e.g. 1.5 */
   float min_focal, max_focal; /**< the lens's whole range: the vignetting metric needs it */
   float center_x, center_y; /**< optical centre shift, lensfun convention (fraction of size) */
-  /** Whether upstream ships <real-focal-length> data for this lens.
-   *
-   * It gates the projection stage rather than feeding it. lensfun's geometry callback uses
-   * GetRealFocalLength(focal) / get_hugin_focal_correction(focal), and MEASURED across the
-   * database that resolves to exactly the nominal focal whenever this is 0 -- the hugin
-   * factor is multiplied in and divided straight back out. When it is 1 the two do not
-   * cancel and the geometry focal is real_focal / hugin, which needs the calibration points
-   * this struct does not carry. Those lenses keep falling back rather than being corrected
-   * with the wrong focal: measured, that error is 28 px at the centre of the frame. */
-  int has_real_focal;
   int n_dist; ls_calib_dist_t dist[LS_MAX_CALIB];
   int n_tca;  ls_calib_tca_t  tca[LS_MAX_CALIB];
   int n_vig;  ls_calib_vig_t  vig[LS_MAX_CALIB];
+  /** <real-focal-length>, which FEEDS the projection stage rather than gating it.
+   *
+   * lensfun's geometry callback runs on GetRealFocalLength(focal) divided by
+   * get_hugin_focal_correction(focal), and those two cancel to exactly the nominal focal
+   * when a lens carries no real-focal data -- the correction is multiplied in and divided
+   * straight back out (modifier.cpp, and measured as a ratio of 1.0000 across every fisheye
+   * in the database). When a lens DOES carry it, they do not cancel: the geometry focal is
+   * real_focal / hugin, which on the Sigma 4.5mm circular fisheye is 0.4727x the nominal
+   * one. Correcting such a lens with its nominal focal is 28 px out at the centre of the
+   * frame and 135 px at the edge, which is why these points have to be carried. */
+  int n_real_focal; ls_calib_real_focal_t real_focal[LS_MAX_CALIB];
 } ls_lens_t;
 
 #define LS_ENABLE_DISTORTION (1 << 0)
