@@ -128,100 +128,68 @@ later replaces one file.
 
 ## Measurements
 
-Head-to-head against liblensfun 0.3.4, 24 Mpx, single-threaded, both sides on the CPU
-([`tests/bench_lensfun.c`](tests/bench_lensfun.c), Nikon AF-S 16-35mm f/4G ED VR):
+Against liblensfun 0.3.4, 24 Mpx, Nikon AF-S 16-35mm f/4G ED VR, on an idle 8-core Xeon
+E3-1505M ([`tests/bench_lensfun.c`](tests/bench_lensfun.c)). Each stage runs five times and
+the best is kept — a shared machine only ever makes a measurement slower, so the minimum is
+the closest thing to the cost of the code. Absolute numbers still drift a few percent
+between sessions; the ratios are what to read.
 
-| | lensfun | LensSerious | |
+| single-threaded | lensfun | LensSerious | |
 |---|---|---|---|
-| open the database | 99.2 ms | **0.261 ms** | 380× faster |
-| find the lens (fuzzy) | 0.031 ms | 0.21 ms | 7× slower |
-| resolve at focal/aperture | 0.5 µs | 0.04 µs | 13× faster |
-| build the whole geometry map | 288.5 ms | 293.4 ms | **1.0× — no faster** |
-| apply vignetting, whole frame | 71.4 ms | **49.3 ms** | 1.4× faster |
-| one image, cold start | 459.2 ms | **343.2 ms** | 1.3× |
-| one more image, warm | 359.9 ms | **342.7 ms** | 1.1× |
+| open the database | 103.7 ms | **0.28 ms** | 370× faster |
+| find the lens (fuzzy) | 0.031 ms | 0.17 ms | 5× slower |
+| resolve at focal/aperture | 0.5 µs | 0.04 µs | 12× faster |
+| build the whole geometry map | 299.6 ms | 295.0 ms | **1.0× — no faster** |
+| apply vignetting, whole frame | 70.8 ms | **48.3 ms** | 1.5× faster |
+| one image, cold start | 474.2 ms | **343.8 ms** | 1.4× |
+| one more image, warm | 370.5 ms | **343.3 ms** | 1.1× |
 
-**The geometry map is not faster on the CPU**, and that is worth stating plainly: the 278 ms
-quoted above was always *lensfun's* cost, and closed-form C pays essentially the same to
-push six floats per pixel through memory.
+### In parallel
 
-The table above is built with the project's default flags. **A consumer's flags matter far
-more than anything in this library**: the same map, same code, 24 Mpx —
+A pixel pipeline runs the per-pixel stages across threads, so they are measured that way
+too. Rows are independent on both sides — lensfun's modifier is const during apply and
+writes only the caller's buffer, which is what lets Ansel parallelise it — so this is the
+same work, not one library's threading model against another's.
 
-| build flags | LensSerious |
-|---|---|
-| `-O3` (baseline x86-64) | 286 ms |
-| `-O3 -march=native` | 217 ms |
-| `-O3 -march=native -ffast-math` | **103 ms** |
+| 8 threads | lensfun | LensSerious | |
+|---|---|---|---|
+| build the whole geometry map | 103.7 ms | **83.8 ms** | 1.2× |
+| apply vignetting, whole frame | 40.7 ms | 41.9 ms | 1.0× |
+| scaling vs. its own 1 thread | 2.84× | 3.51× | |
 
-Ansel compiles with the last of those, so the map there costs ~100 ms, not the 300 the
-benchmark reports. (`-ffast-math` also means Ansel's CPU results are no longer bit-identical
-to its GPU ones — the parity harness is built without it, and that is where the bit-exactness
-claim holds.)
+Neither scales linearly, and vignetting converges to ~41 ms for both: 732 MB read and
+written in 0.041 s is about 18 GB/s, which is the memory bus rather than either library. It
+is also why the 1.5× single-threaded advantage disappears — LensSerious is already close to
+the ceiling with one thread.
 
-Four attempts to close the remaining gap to a hand-written specialised loop (~75 ms) were
-measured and **all reverted**, which is why the code still looks the way it does:
+## The map, versus never building one
 
-- **specialising all twelve (distortion, TCA) pairs** — far worse, 103 → 263 ms: twelve call
-  sites exhaust the inliner's budget, so nothing folds at all;
-- **specialising only the dominant pair** (ptlens + poly3, which is 4810/5690 and 3355/3361
-  of the database) — no change;
-- **`restrict` on the evaluator arguments** — ~5%, within the run-to-run noise;
-- **making the row the primitive and the pixel `count == 1`**, so the row's `y·scale − centre`
-  and ptlens's `1 − a − b − c` are hoisted — no change (100.7 ms against 101.1, best of five).
+A correction is only ever wanted so that something can **resample** with it, and that is
+where the two libraries actually differ. lensfun can only deliver a correction as a buffer:
+its callbacks fill six floats per pixel and the consumer reads them back. LensSerious can be
+called per pixel, so a consumer can evaluate the coordinates where it needs them and never
+materialise anything — which is what the OpenCL kernels do, and what the CPU can do equally
+well.
 
-What remains is arithmetic: one square root and ~20 flops per pixel, and a 24-byte scatter
-into an interleaved output whose layout is fixed by compatibility with lensfun's buffer.
-Closing it needs SIMD across pixels with SoA staging, which is a different function and puts
-the CPU/GPU bit-exactness at risk. It is also the row that matters least, because on a GPU
-the map is never built at all.
+All three produce the same image. The difference is 1.1 GB of memory traffic per frame: 549
+MB written by the map pass, 549 MB read back by the resampler.
 
-The **fuzzy lookup** was 2.89 ms — 96× slower — until it was profiled. It was not the
-database losing to an in-memory search, it was two mistakes. It scored every one of the
-~4700 catalogue names on every lookup, where lensfun rejects almost every candidate on two
-float compares before touching a string; and `lens_name` was indexed on `norm` and nothing
-else, so the query gathering candidates scanned the whole table anyway.
+| correct + resample, 24 Mpx | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|
+| lensfun: map, then resample | 764 ms | 416 | 235 | 238 |
+| LensSerious: map, then resample | 742 ms | 403 | 229 | 215 |
+| LensSerious: **fused, no map** | 866 ms | 447 | 227 | **169** |
+| fused vs. lensfun | 0.88× | 0.93× | 1.04× | **1.41×** |
 
-The fix is to score fewer names, not to score faster: `lens_token` and `token_df` let a
-lookup ask which of the *query's* tokens is rarest — `16` or `nikkor` reaches tens of lenses
-where `mm` or `f` reaches thousands — and gather only those, falling back to the full scan
-if that finds nothing, so the answer never depends on the pruning. 2.89 ms → 0.19 ms, with
-agreement unchanged at 99.0%.
+**Fusing is a loss until four threads and a win after**, and the crossover is the point. With
+one thread the work is latency-bound: two tight loops each optimise and prefetch better than
+one fused loop that interleaves evaluation with scattered reads. With eight, the two-pass
+form saturates the memory bus and stops scaling — lensfun goes 235 → 238 ms from four threads
+to eight, gaining nothing — while the fused pass has no map traffic to saturate on and keeps
+scaling.
 
-Three things were tried, measured, and are deliberately *not* in the code:
-
-- gathering candidates on **all** the query's tokens — no better than the scan it replaces,
-  since `mm`, `f`, `ed`, `vr` are in most names;
-- **hashing the tokens** to compare them faster — moved nothing. The per-comparison cost was
-  already ~5 ns; there were simply half a million comparisons;
-- **resolving the brand first**, to split the space before matching the model. The database
-  says the opposite: the query's rarest model token (`16`) reaches 55 lenses where the maker
-  (`nikon`) reaches 238, so the token already prunes 4.3× harder. As a *second* filter it is
-  worse still — an `EXISTS` on the maker returns 12× fewer rows and takes twice as long
-  (0.144 ms against 0.071 ms), because the correlated subquery costs more per candidate than
-  the candidates it removes. Requiring the maker would cost accuracy too: it is scored rather
-  than required precisely because vendors and upstream disagree about vendors' own names.
-
-Then the indexes were looked at properly. Both matcher queries reported `SEARCH … USING
-INDEX`, which reads like the work is done — but the row an index lands on is an index entry,
-and every column outside it is another b-tree descent into the table. Making them **covering**
-(`lens_name(lens_id, kind, norm)`, `lens_token(kind, token, lens_id)`) removed those descents:
-0.180 → 0.150 ms. And the `calib_*` tables, which are only ever read one lens at a time, are
-now `WITHOUT ROWID` keyed on `(lens_id, ord)`, so a lens's calibration is contiguous and the
-read never leaves the b-tree — 0.0436 → 0.0385 ms, and *smaller*, since three `lens_id`
-indexes go away. `ord` also turns the reader's row-order assumption into a primary key rather
-than a habit.
-
-What remains is spread thin — scoring 21%, SQLite 28% over two queries, tokenising 8% — at
-~2 ns per token comparison, with no single error left. **6.7× lensfun, from 96×.**
-
-**Vignetting** was 1.8× *slower* until the divides were counted. Three causes, worth
-recording because two of them are not about arithmetic: the half-diagonal coordinate system
-was computed with a divide per axis per pixel (now a folded multiply-and-subtract carried in
-`ls_eval_t`); the row-invariant y term was recomputed per pixel; and a `c == 0` guard —
-which was not upstream behaviour either — was a second conditional that stopped the caller's
-loop vectorising **entirely**, leaving `divss` where there should be `divps`. Removing it and
-splitting the row into fill-then-scale gives four divides per instruction. 117 ms → 43 ms.
+That is the same effect the GPU shows, at the other end of the scale: a device with thousands
+of threads is so far past the crossover that not building the map is worth 165× (below).
 
 ## What it costs to reach a GPU
 
@@ -230,20 +198,20 @@ This is where the design claim actually lives, and it is not about arithmetic
 
 | geometry map, 549 MB of coordinates | |
 |---|---|
-| lensfun: build on the CPU | 555.5 ms |
-| lensfun: upload it | 107.8 ms |
-| **lensfun: total to reach the device** | **663.3 ms** |
-| LensSerious: the same map, on the device | 37.0 ms — **17.9×** |
-| LensSerious: evaluated, never stored | 3.4 ms — **196×** |
+| lensfun: build on the CPU | 481.7 ms |
+| lensfun: upload it | 76.5 ms |
+| **lensfun: total to reach the device** | **558.2 ms** |
+| LensSerious: the same map, on the device | 35.9 ms — **15.5×** |
+| LensSerious: evaluated, never stored | 3.4 ms — **165×** |
 
 | vignetting, 366 MB of multipliers | |
 |---|---|
-| **lensfun: total to reach the device** | **317.1 ms** |
-| LensSerious: on the device | 1.7 ms — **187×** |
+| **lensfun: total to reach the device** | **258.7 ms** |
+| LensSerious: on the device | 1.7 ms — **153×** |
 
-The CPU build is 555 ms here against 269 ms in the table above. Same single-threaded loop —
+The CPU build is 482 ms here against 300 ms in the table above. Same single-threaded loop —
 the difference is that this one materialises the whole 549 MB buffer, while the other reuses
-one row. 555 ms is what a GPU pipeline actually pays, because it needs the entire map before
+one row. 482 ms is what a GPU pipeline actually pays, because it needs the entire map before
 it can upload any of it.
 
 The middle row is the apples-to-apples comparison: the same buffer, produced the two
@@ -270,6 +238,7 @@ Where the design wins is not arithmetic, it is architecture:
 | database (XML → SQLite) + stateless lock-free reader | done; whole database verified field-by-field against liblensfun |
 | fuzzy matching | done; **99.0%** agreement with liblensfun's own top pick over the whole database (100% verbatim, 99.5% maker-stripped), at 0.19 ms a lookup |
 | OpenCL | evaluators compile as OpenCL C from the same header; Ansel consumes them per work-item |
+| map-less (fused) evaluation on the CPU | measured; a win from four threads up, a loss below — see above. Not yet offered as an API: consumers call `ls_eval_map()` per pixel themselves, as `tests/bench_lensfun.c` does |
 | upstream sync (`version_2` conversion tooling) | not started |
 | native XML reader (dropping liblensfun from the importer) | not started |
 | CPU geometry map vectorisation | **open** — the loop is scalar because the model dispatch inside the per-pixel evaluator is loop-invariant and the compiler will not unswitch it |

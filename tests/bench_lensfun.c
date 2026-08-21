@@ -35,6 +35,17 @@
 
 #ifdef _OPENMP
   #include <omp.h>
+  #define LS_OMP_FOR _Pragma("omp parallel for schedule(static)")
+  #define LS_THREADS omp_get_max_threads()
+#else
+  #define LS_OMP_FOR
+  #define LS_THREADS 1
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+  #define LS_B_RESTRICT __restrict__
+#else
+  #define LS_B_RESTRICT
 #endif
 
 static double now_ms(void)
@@ -48,7 +59,7 @@ static double now_ms(void)
  * makes a measurement slower, never faster, so the minimum is the closest thing to the
  * cost of the code; the mean measures the machine's other tenants. Taking one sample gave
  * lensfun's single-threaded map as 333 ms in one run and 532 ms in the next. */
-enum { REPEATS = 3 };
+enum { REPEATS = 5 };
 
 #define TIME_BEST(best, body)                                                             \
   do {                                                                                     \
@@ -61,6 +72,38 @@ enum { REPEATS = 3 };
       if(_d < (best)) (best) = _d;                                                          \
     }                                                                                      \
   } while(0)
+
+/* One bilinear tap per channel, each at its own coordinates -- the three channels of a
+ * subpixel map do not land on the same pixel, which is the whole reason the map has six
+ * floats and not two. Cheap on purpose: this stands in for a resampler so that the MEMORY
+ * behaviour of fetching coordinates is what differs between the variants, not the filter. */
+static inline void _resample_pixel(const float *LS_B_RESTRICT src, int w, int h,
+                                   const float *LS_B_RESTRICT c6,
+                                   float *LS_B_RESTRICT out)
+{
+  for(int ch = 0; ch < 3; ch++)
+  {
+    float fx = c6[ch * 2], fy = c6[ch * 2 + 1];
+    fx = (fx < 0.f) ? 0.f : ((fx > (float)(w - 2)) ? (float)(w - 2) : fx);
+    fy = (fy < 0.f) ? 0.f : ((fy > (float)(h - 2)) ? (float)(h - 2) : fy);
+    const int ix = (int)fx, iy = (int)fy;
+    const float tx = fx - (float)ix, ty = fy - (float)iy;
+    const float *p00 = src + ((size_t)iy * w + ix) * 4 + ch;
+    const float *p10 = p00 + 4;
+    const float *p01 = p00 + (size_t)w * 4;
+    const float *p11 = p01 + 4;
+    out[ch] = (*p00 * (1.f - tx) + *p10 * tx) * (1.f - ty)
+            + (*p01 * (1.f - tx) + *p11 * tx) * ty;
+  }
+  out[3] = 1.f;
+}
+
+static void _resample_row(const float *LS_B_RESTRICT src, int w, int h,
+                          const float *LS_B_RESTRICT map, float *LS_B_RESTRICT dst, int count)
+{
+  for(int x = 0; x < count; x++)
+    _resample_pixel(src, w, h, map + (size_t)x * 6, dst + (size_t)x * 4);
+}
 
 static void row(const char *what, double lf, double ls, const char *unit)
 {
@@ -285,6 +328,90 @@ int main(int argc, char **argv)
 #else
   (void)t_lf_map_mt; (void)t_ls_map_mt; (void)t_lf_vig_mt; (void)t_ls_vig_mt;
 #endif
+
+  /* --- 6. the map, versus never building one ----------------------------- */
+  /*
+   * The point of the whole library, measured on the CPU this time.
+   *
+   * A correction is only ever wanted so that something can RESAMPLE with it. lensfun can
+   * only deliver it as a buffer: its callbacks fill six floats per pixel, and the consumer
+   * then reads them back. LensSerious can be called per pixel, so the consumer can evaluate
+   * the coordinates where it needs them and never materialise anything -- which is exactly
+   * what the OpenCL kernels do, and there is no reason the CPU cannot do the same.
+   *
+   * All three produce the same image. The difference is 1.1 GB of memory traffic: 549 MB
+   * written by the map pass and 549 MB read back by the resampler.
+   */
+  {
+    const size_t pix = (size_t)W * H;
+    float *src = (float *)malloc(pix * 4 * sizeof(float));
+    float *dst = (float *)malloc(pix * 4 * sizeof(float));
+    float *map = (float *)malloc(pix * 6 * sizeof(float));
+    if(src && dst && map)
+    {
+      for(size_t i = 0; i < pix * 4; i++) src[i] = 0.5f;
+
+      lfModifier *fm = lf_modifier_new(lf, crop, W, H);
+      lf_modifier_initialize(fm, lf, LF_PF_F32, focal, aperture, distance, 1.f,
+                             LF_RECTILINEAR, LF_MODIFY_DISTORTION | LF_MODIFY_TCA, 0);
+      ls_modifier_init(&mod, &lens, crop, W, H, focal, aperture, distance, 1.f,
+                       LS_LENS_UNKNOWN, LS_ENABLE_DISTORTION | LS_ENABLE_TCA);
+      ls_eval_t ep;
+      ls_eval_from_modifier(&mod, &ep);
+
+      double t_lf_two = 0.0, t_ls_two = 0.0, t_ls_fused = 0.0;
+
+      /* lensfun: fill the map, then resample from it. */
+      TIME_BEST(t_lf_two, {
+        LS_OMP_FOR
+        for(int y = 0; y < H; y++)
+          lf_modifier_apply_subpixel_geometry_distortion(fm, 0.f, (float)y, W, 1,
+                                                         map + (size_t)y * W * 6);
+        LS_OMP_FOR
+        for(int y = 0; y < H; y++)
+          _resample_row(src, W, H, map + (size_t)y * W * 6, dst + (size_t)y * W * 4, W);
+      });
+
+      /* LensSerious, the same two passes, for a like-for-like comparison. */
+      TIME_BEST(t_ls_two, {
+        LS_OMP_FOR
+        for(int y = 0; y < H; y++)
+          ls_modifier_apply_subpixel_geometry(&mod, 0.f, (float)y, W, 1,
+                                              map + (size_t)y * W * 6);
+        LS_OMP_FOR
+        for(int y = 0; y < H; y++)
+          _resample_row(src, W, H, map + (size_t)y * W * 6, dst + (size_t)y * W * 4, W);
+      });
+
+      /* LensSerious, fused: the coordinates never leave a register. */
+      TIME_BEST(t_ls_fused, {
+        LS_OMP_FOR
+        for(int y = 0; y < H; y++)
+        {
+          float *drow = dst + (size_t)y * W * 4;
+          for(int x = 0; x < W; x++)
+          {
+            float c6[6];
+            ls_eval_map(&ep, (float)x, (float)y, c6);
+            _resample_pixel(src, W, H, c6, drow + (size_t)x * 4);
+          }
+        }
+      });
+
+      printf("\n  correct-and-resample a whole frame, %d thread(s)\n", LS_THREADS);
+      printf("  %-34s %10.2f ms\n", "lensfun: map, then resample", t_lf_two);
+      printf("  %-34s %10.2f ms\n", "LensSerious: map, then resample", t_ls_two);
+      printf("  %-34s %10.2f ms   %8.1fx\n", "LensSerious: fused, no map",
+             t_ls_fused, t_lf_two / t_ls_fused);
+      printf("  the fused pass never writes the %zu MB map, nor reads it back\n",
+             pix * 6 * sizeof(float) / 1048576);
+
+      lf_modifier_destroy(fm);
+    }
+    free(src);
+    free(dst);
+    free(map);
+  }
 
   /* --- what a session actually pays ------------------------------------- */
 
