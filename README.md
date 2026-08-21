@@ -52,9 +52,12 @@ corrected render ever made.
 Four instruments hold that line:
 
 - [`tests/parity_lensfun.c`](tests/parity_lensfun.c) links **both** libraries and walks
-  the entire installed database: every lens × three focal lengths × a 5×5 sample grid,
-  geometry asserted to 0.01 px and vignetting to 1e-4. Configurations LensSerious declines
-  to serve are **skipped and counted**, never silently passed.
+  the entire installed database: every lens × three focal lengths × a 5×5 sample grid plus
+  64 probes along a full row, geometry asserted to 0.01 px and vignetting to 1e-4.
+  Configurations LensSerious declines to serve are **skipped and counted**, never silently
+  passed. Every comparison is made against liblensfun's **width-1** answer, which is its
+  scalar math by construction — so the verdict does not depend on which path upstream chose
+  for a row, nor on an interposition binding.
 - [`tests/parity_db.c`](tests/parity_db.c) checks every field of every lens the importer
   wrote against liblensfun, *exactly*, and runs eight threads with their own handles over
   the same file to exercise the no-mutex contract.
@@ -75,9 +78,12 @@ harness for the first time:
   `sqrt(r²)` as `_mm_rcp_ps(_mm_rsqrt_ps(r²))` — two chained 12-bit approximations with no
   Newton step (`mod-coord-sse.cpp`) — and disagree with lensfun's *own scalar math* by up
   to 0.8 px at the end of wide rows on strong wide-angle lenses. Every lensfun-corrected
-  render carries that error. LensSerious evaluates exactly (identically on CPU and GPU) and
-  matches upstream's **scalar** semantics to < 0.01 px over the whole database; the parity
-  harness forces upstream onto its scalar path by interposing its CPU detection.
+  render carries that error. The harness measures it rather than asserting it: CI reports
+  **0.712769 px** on a Sigma 17-50mm f/2.8 EX DC HSM, on a different machine and a
+  different distribution build of liblensfun than the figure above came from. LensSerious
+  evaluates exactly, identically on CPU and GPU, and matches upstream's **scalar** answer to
+  **0.000244 px** over the whole database — the same worst case on both machines, whichever
+  path upstream's own row code took.
 - **The `pa` vignetting polynomial is not constrained to stay positive**, and for some
   lenses it crosses zero *inside the frame* — the Canon EF 8-15mm Fisheye at 8mm has
   k = (−0.625, 5.648, −19.330), whose root sits near r = 0.65. Past it the correction 1/c
