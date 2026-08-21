@@ -67,6 +67,20 @@ extern "C" {
  */
 size_t ls_db_normalize(const char *in, char *out, size_t out_size);
 
+/** @brief The tokens ls_db_match_lens() compares, from an already-normalised name.
+ *
+ * @details Split on spaces, and again wherever a letter meets a digit -- normalisation
+ * drops '-', so "16-35mm" would otherwise fuse into one meaningless token instead of
+ * matching the catalogue's "16 35mm".
+ *
+ * Exposed for the same reason as ls_db_normalize(): the importer writes these into the
+ * token index and the matcher looks them up, so there must be exactly one implementation.
+ *
+ * @param out_tokens caller's array of @p max buffers, each at least @p stride bytes.
+ * @return how many tokens were written.
+ */
+int ls_db_tokenize(const char *norm, char *out_tokens, int max, int stride);
+
 /** An open database. Not shared between threads; see @ref threading. */
 typedef struct ls_db_t ls_db_t;
 

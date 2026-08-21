@@ -519,19 +519,19 @@ typedef struct
  * halves of a focal range would fuse into one meaningless token and stop matching the
  * catalogue's "16 35mm". Splitting where a digit meets a letter, and where a letter meets
  * a digit, keeps "16", "35", "mm", "f", "4g" as separate comparable units. */
-static void _tokenize(const char *norm, ls_tokens_t *out)
+int ls_db_tokenize(const char *norm, char *out_tokens, int max, int stride)
 {
-  out->n = 0;
-  const char *p = norm;
-  while(*p && out->n < LS_MAX_TOKENS)
+  int n = 0;
+  const char *p = norm ? norm : "";
+  while(*p && n < max)
   {
     while(*p == ' ') p++;
     if(!*p) break;
 
-    char *w = out->t[out->n];
+    char *w = out_tokens + (size_t)n * stride;
     int len = 0;
     int prev_digit = -1;
-    while(*p && *p != ' ' && len < LS_TOKEN_LEN - 1)
+    while(*p && *p != ' ' && len < stride - 1)
     {
       const int is_digit = (*p >= '0' && *p <= '9');
       if(prev_digit >= 0 && is_digit != prev_digit) break;   /* letter<->digit boundary */
@@ -539,8 +539,14 @@ static void _tokenize(const char *norm, ls_tokens_t *out)
       prev_digit = is_digit;
     }
     w[len] = '\0';
-    if(len) out->n++;
+    if(len) n++;
   }
+  return n;
+}
+
+static void _tokenize(const char *norm, ls_tokens_t *out)
+{
+  out->n = ls_db_tokenize(norm, &out->t[0][0], LS_MAX_TOKENS, LS_TOKEN_LEN);
 }
 
 /**
@@ -618,9 +624,22 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
   _tokenize(nmaker, &pat_maker);
   if(pat.n == 0) return 0;
 
-  /* One scan over the name table, scored in C. At ~3000 rows this is microseconds, and it
-   * keeps the scoring in one readable place instead of spread across SQL expressions that
-   * cannot be unit-tested. The mount filter is pushed into SQL because it is selective. */
+  /* One scan over the name table, scored in C. ~4700 rows, and the scoring is where the
+   * time goes rather than the SQL: measured 2.97 ms per lookup against lensfun's 0.027 ms,
+   * because lensfun is comparing structs already in RAM and this is walking a b-tree.
+   *
+   * An inverted token index was built and MEASURED, and it is not here because it made
+   * things worse: 5.13 ms, for identical agreement. Model tokens are not selective --
+   * "mm", "f", "ed", "vr" and the focal digits each match a large fraction of the
+   * catalogue -- so the candidate set stayed near the full table and the subquery was pure
+   * added cost. The schema is simpler for its absence.
+   *
+   * 3 ms is once per image, against 272 ms to build that image's map and the 88 ms of XML
+   * parsing this design removes outright. It is not the bottleneck; it is only the one
+   * place a database loses to an in-memory search, and worth stating plainly.
+   *
+   * The scoring stays in C rather than in SQL expressions, which could not be read or
+   * unit-tested. The mount filter is pushed into SQL because that one IS selective. */
   sqlite3_stmt *st = NULL;
   const char *sql =
       (mount_id > 0)

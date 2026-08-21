@@ -87,6 +87,12 @@ if(LENSSERIOUS_TESTS)
       target_compile_options(match_lensfun PRIVATE -Wall -Wextra)
       set_target_properties(match_lensfun PROPERTIES C_STANDARD 11)
       add_test(NAME db_match COMMAND match_lensfun ${CMAKE_CURRENT_BINARY_DIR}/lenses.db)
+
+      # Not a test: it measures, it does not assert. Run it by hand.
+      add_executable(bench_lensfun tests/bench_lensfun.c)
+      target_link_libraries(bench_lensfun PRIVATE lensserious_db PkgConfig::LENSFUN m)
+      target_compile_options(bench_lensfun PRIVATE -Wall -Wextra)
+      set_target_properties(bench_lensfun PROPERTIES C_STANDARD 11)
       set_tests_properties(db_match PROPERTIES FIXTURES_REQUIRED LENSDB)
       set_tests_properties(db_import PROPERTIES FIXTURES_SETUP LENSDB)
       set_tests_properties(db_parity PROPERTIES FIXTURES_REQUIRED LENSDB)
