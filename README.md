@@ -18,9 +18,25 @@ Yet the actual mathematics is six small closed forms. A census of the complete
 `version_1` database (2026): distortion **ptlens/poly3/poly5** (4810/875/5 entries),
 TCA **poly3/linear** (3355/6), vignetting **pa** (25269 — the only model). LensSerious
 expresses those forms as plain C over a plain struct of coefficients, so the same
-evaluation runs vectorised on the CPU, inside an OpenCL kernel
-([`opencl/lensserious.cl`](opencl/lensserious.cl) is the same math, textually), or
-anywhere a float goes.
+evaluation runs vectorised on the CPU, inside an OpenCL kernel, or anywhere a float goes.
+
+Not "the same math, textually" — **the same text**.
+[`include/lensserious_eval.h`](include/lensserious_eval.h) holds the evaluators, and it
+is compiled twice: as C99 into the library, and as OpenCL C by the host's driver. There
+is no second copy to drift, which matters because the two copies this replaced already
+had: the kernel computed its square roots with `native_sqrt` — a 12-bit approximation,
+against the library's `sqrtf` — and never grew a vignetting evaluator at all. Neither
+was visible to a harness that only tests the CPU side. `ctest` now compiles the kernel
+offline through clang's OpenCL mode, so the second compilation is checked like the first.
+
+A correction therefore crosses to the GPU as an
+[`ls_eval_t`](include/lensserious_eval.h) — about 80 bytes of scalars, passed by value as
+a kernel argument — and each work-item evaluates its own coordinates. Not a
+six-float-per-pixel map: that is 576 MB of transfer for a 24 Mpx frame, on top of the
+278 ms spent building it. A consuming kernel `#include`s the header and calls
+`ls_eval_map()` where it needs a source coordinate;
+[`opencl/lensserious.cl`](opencl/lensserious.cl) keeps map-writing kernels only so a host
+can verify the device against the CPU.
 
 **The lensfun project is not being forked.** Its XML database remains the interchange
 format and its community remains the source of calibrations. Only the runtime is

@@ -51,6 +51,9 @@
 
 #include <stddef.h>
 
+/* The closed forms themselves, shared verbatim with opencl/lensserious.cl. */
+#include "lensserious_eval.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -148,6 +151,18 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                      float crop, int width, int height,
                      float focal, float aperture, float distance,
                      float scale, int flags);
+
+/**
+ * @brief Flatten a resolved modifier into the scalar block a kernel can take by value.
+ *
+ * @details This is the whole point of the exercise: a correction crosses to the GPU as
+ * ~80 bytes of coefficients that every work-item evaluates for itself, instead of a
+ * six-float-per-pixel map that the CPU builds single-threaded and then uploads (measured
+ * at 278 ms plus 576 MB of transfer for a 24 Mpx frame).
+ *
+ * @return 0 if either pointer is NULL, 1 otherwise.
+ */
+int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out);
 
 /**
  * @brief The geometry map: for @p count output pixels starting at (@p xu, @p yu),

@@ -14,6 +14,7 @@
 */
 
 #include "lensserious.h"
+#include "lensserious_eval.h"
 
 #include <float.h>
 #include <math.h>
@@ -265,70 +266,61 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
 }
 
 /* ------------------------------------------------------------------------- */
-/* The map. Composition order is lensfun's callback-priority order for the     */
-/* correction direction: scaling (100) → [projection: unsupported, reported]  */
-/* → distortion (750), then the TCA subpixel stage per channel.               */
+/* The map. The closed forms themselves live in include/lensserious_eval.h,   */
+/* which the OpenCL kernel includes verbatim: the CPU and the GPU evaluate    */
+/* one source text, so they cannot drift apart between releases.              */
 /* ------------------------------------------------------------------------- */
 
-static inline void _dist_eval(const ls_calib_dist_t *d, float *x, float *y)
-{
-  const float xu = *x, yu = *y;
-  const float ru2 = xu * xu + yu * yu;
-  float m = 1.f;
-  switch(d->model)
-  {
-    case LS_DIST_POLY3:
-    {   /* mod-coord.cpp: Rd = Ru · (1 − k1 + k1·Ru²) */
-      const float k1 = d->terms[0];
-      m = (1.f - k1) + k1 * ru2;
-      break;
-    }
-    case LS_DIST_POLY5:
-    {   /* Rd = Ru · (1 + k1·Ru² + k2·Ru⁴) */
-      m = 1.f + d->terms[0] * ru2 + d->terms[1] * ru2 * ru2;
-      break;
-    }
-    case LS_DIST_PTLENS:
-    {   /* Rd = Ru · (a·Ru³ + b·Ru² + c·Ru + d), d = 1−a−b−c */
-      const float a = d->terms[0], b = d->terms[1], c = d->terms[2];
-      const float r = sqrtf(ru2);
-      m = a * ru2 * r + b * ru2 + c * r + (1.f - a - b - c);
-      break;
-    }
-    default: break;
-  }
-  *x = xu * m;
-  *y = yu * m;
-}
+/* ls_eval_from_modifier() casts the model enums straight to int, and the kernel compares
+ * the result against the LS_EVAL_* mirrors in lensserious_eval.h -- which cannot name the
+ * enums, since it must also compile as OpenCL C. Renumbering an enum without touching its
+ * mirror would make every GPU render evaluate the wrong model, silently and only on the
+ * GPU. Cheapest possible place to catch that is here, at compile time. */
+_Static_assert((int)LS_DIST_NONE   == LS_EVAL_DIST_NONE,   "distortion model mirror drifted");
+_Static_assert((int)LS_DIST_POLY3  == LS_EVAL_DIST_POLY3,  "distortion model mirror drifted");
+_Static_assert((int)LS_DIST_POLY5  == LS_EVAL_DIST_POLY5,  "distortion model mirror drifted");
+_Static_assert((int)LS_DIST_PTLENS == LS_EVAL_DIST_PTLENS, "distortion model mirror drifted");
+_Static_assert((int)LS_TCA_NONE    == LS_EVAL_TCA_NONE,    "TCA model mirror drifted");
+_Static_assert((int)LS_TCA_LINEAR  == LS_EVAL_TCA_LINEAR,  "TCA model mirror drifted");
+_Static_assert((int)LS_TCA_POLY3   == LS_EVAL_TCA_POLY3,   "TCA model mirror drifted");
+_Static_assert((int)LS_VIG_NONE    == LS_EVAL_VIG_NONE,    "vignetting model mirror drifted");
+_Static_assert((int)LS_VIG_PA      == LS_EVAL_VIG_PA,      "vignetting model mirror drifted");
 
-static inline void _tca_eval(const ls_calib_tca_t *t, float *xr, float *yr, float *xb, float *yb)
+_Static_assert(LS_ENABLE_DISTORTION == LS_EVAL_ENABLE_DISTORTION, "enable bit mirror drifted");
+_Static_assert(LS_ENABLE_TCA        == LS_EVAL_ENABLE_TCA,        "enable bit mirror drifted");
+_Static_assert(LS_ENABLE_VIGNETTING == LS_EVAL_ENABLE_VIGNETTING, "enable bit mirror drifted");
+_Static_assert(LS_ENABLE_SCALE      == LS_EVAL_ENABLE_SCALE,      "enable bit mirror drifted");
+
+/* ls_eval_t crosses to the device as a by-value kernel argument, so host and device must
+ * lay it out identically. Scalars only is what guarantees that; this pins the consequence
+ * so adding a float2 (or a double, or a bool) fails to build instead of corrupting every
+ * field after it. */
+_Static_assert(sizeof(ls_eval_t) == 6 * sizeof(float) + 4 * sizeof(int) + 12 * sizeof(float),
+               "ls_eval_t gained padding or a member: check it is still scalar-only");
+_Static_assert(_Alignof(ls_eval_t) == _Alignof(float), "ls_eval_t alignment is no longer 4");
+
+int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
 {
-  switch(t->model)
-  {
-    case LS_TCA_LINEAR:
-    {   /* mod-subpix.cpp: per-channel radial scale */
-      const float kr = t->terms[0], kb = t->terms[1];
-      *xr *= kr; *yr *= kr;
-      *xb *= kb; *yb *= kb;
-      break;
-    }
-    case LS_TCA_POLY3:
-    {   /* Rd = Ru · (b·Ru² + c·Ru + v), params packed vr vb cr cb br bb */
-      const float vr = t->terms[0], vb = t->terms[1];
-      const float cr = t->terms[2], cb = t->terms[3];
-      const float br = t->terms[4], bb = t->terms[5];
-      float x = *xr, y = *yr;
-      float ru2 = x * x + y * y;
-      float m = br * ru2 + vr + (cr != 0.f ? cr * sqrtf(ru2) : 0.f);
-      *xr = x * m; *yr = y * m;
-      x = *xb; y = *yb;
-      ru2 = x * x + y * y;
-      m = bb * ru2 + vb + (cb != 0.f ? cb * sqrtf(ru2) : 0.f);
-      *xb = x * m; *yb = y * m;
-      break;
-    }
-    default: break;
-  }
+  if(!mod || !out) return 0;
+  memset(out, 0, sizeof(*out));
+
+  out->norm_scale = mod->norm_scale;
+  out->norm_unscale = mod->norm_unscale;
+  out->center_x = mod->center_x;
+  out->center_y = mod->center_y;
+  out->aspect_ratio_correction = mod->aspect_ratio_correction;
+  out->scale = mod->scale;
+  out->enabled = mod->enabled;
+
+  out->dist_model = (int)mod->dist.model;
+  out->tca_model = (int)mod->tca.model;
+  out->vig_model = (int)mod->vig.model;
+
+  for(int i = 0; i < 3; i++) out->dist_terms[i] = mod->dist.terms[i];
+  for(int i = 0; i < 6; i++) out->tca_terms[i] = mod->tca.terms[i];
+  for(int i = 0; i < 3; i++) out->vig_terms[i] = mod->vig.terms[i];
+
+  return 1;
 }
 
 int ls_modifier_apply_subpixel_geometry(const ls_modifier_t *mod,
@@ -336,40 +328,24 @@ int ls_modifier_apply_subpixel_geometry(const ls_modifier_t *mod,
                                         float *res)
 {
   if(!mod || !res || width <= 0 || height <= 0) return 0;
-  const int do_dist = (mod->enabled & LS_ENABLE_DISTORTION);
-  const int do_tca = (mod->enabled & LS_ENABLE_TCA);
-  const int do_scale = (mod->enabled & LS_ENABLE_SCALE);
 
-  /* Exact per-column evaluation, identical to the OpenCL kernel, and deliberately NOT
-   * bit-matched to upstream's row walker: lensfun's SSE path computes sqrt as
-   * _mm_rcp_ps(_mm_rsqrt_ps(r2)) -- two chained 12-bit approximations with no Newton
-   * step (mod-coord-sse.cpp) -- and disagrees with its own scalar math by up to 0.19 px
-   * at the end of a 6016-wide row. Matching that would mean reimplementing an
-   * approximation error. LensSerious matches upstream's SCALAR semantics to < 0.01 px;
-   * against upstream's SSE rows the residual is bounded by upstream's own approximation,
-   * and the parity harness asserts both bounds separately. */
+  ls_eval_t p;
+  ls_eval_from_modifier(mod, &p);
+
+  /* Exact per-pixel evaluation, identical to the OpenCL kernel because it IS the OpenCL
+   * kernel's code, and deliberately NOT bit-matched to upstream's row walker: lensfun's
+   * SSE path computes sqrt as _mm_rcp_ps(_mm_rsqrt_ps(r2)) -- two chained 12-bit
+   * approximations with no Newton step (mod-coord-sse.cpp) -- and disagrees with its own
+   * scalar math by up to 0.19 px at the end of a 6016-wide row. Matching that would mean
+   * reimplementing an approximation error. LensSerious matches upstream's SCALAR semantics
+   * to < 0.01 px; against upstream's SSE rows the residual is bounded by upstream's own
+   * approximation, and the parity harness asserts both bounds separately. */
   for(int row = 0; row < height; row++)
   {
     float *out = res + (size_t)row * width * 6;
-    const float y0 = (yu + row) * mod->norm_scale - mod->center_y;
+    const float y = yu + (float)row;
     for(int col = 0; col < width; col++, out += 6)
-    {
-      float x = (xu + col) * mod->norm_scale - mod->center_x;
-      float y = y0;
-
-      if(do_scale) { x *= mod->scale; y *= mod->scale; }
-      if(do_dist) _dist_eval(&mod->dist, &x, &y);
-
-      float xr = x, yr = y, xb = x, yb = y;
-      if(do_tca) _tca_eval(&mod->tca, &xr, &yr, &xb, &yb);
-
-      out[0] = (xr + mod->center_x) * mod->norm_unscale;
-      out[1] = (yr + mod->center_y) * mod->norm_unscale;
-      out[2] = (x  + mod->center_x) * mod->norm_unscale;
-      out[3] = (y  + mod->center_y) * mod->norm_unscale;
-      out[4] = (xb + mod->center_x) * mod->norm_unscale;
-      out[5] = (yb + mod->center_y) * mod->norm_unscale;
-    }
+      ls_eval_map(&p, xu + (float)col, y, out);
   }
   return 1;
 }
@@ -380,29 +356,20 @@ int ls_modifier_apply_vignetting(const ls_modifier_t *mod,
 {
   if(!mod || !rgba || width <= 0 || height <= 0) return 0;
   if(!(mod->enabled & LS_ENABLE_VIGNETTING)) return 0;
-  const float k1 = mod->vig.terms[0], k2 = mod->vig.terms[1], k3 = mod->vig.terms[2];
+
+  ls_eval_t p;
+  ls_eval_from_modifier(mod, &p);
+
   const size_t stride = row_stride_bytes ? (size_t)row_stride_bytes / sizeof(float)
                                          : (size_t)width * 4;
-
-  /* "Damn! Hugin uses two different 'normalized' coordinate systems: for distortions it
-   * uses 1.0 = min(half width, half height) and for vignetting it uses 1.0 = half
-   * diagonal length." (mod-color.cpp) -- so this radius is the geometry one divided by
-   * the aspect-ratio correction. And CORRECTION divides: ModifyColor_DeVignetting_PA
-   * applies 1/c; multiplying by c is what APPLIES vignetting. The first harness run got
-   * both of these wrong and measured multiplier deltas up to 37.9 for it. */
-  const float arc = (mod->aspect_ratio_correction > 0.f) ? mod->aspect_ratio_correction : 1.f;
 
   for(int row = 0; row < height; row++)
   {
     float *px = rgba + (size_t)row * stride;
-    const float y = ((yu + row) * mod->norm_scale - mod->center_y) / arc;
+    const float y = yu + (float)row;
     for(int col = 0; col < width; col++, px += 4)
     {
-      const float x = ((xu + col) * mod->norm_scale - mod->center_x) / arc;
-      const float r2 = x * x + y * y;
-      const float r4 = r2 * r2;
-      const float c = 1.f + k1 * r2 + k2 * r4 + k3 * r4 * r2;
-      const float inv = (c != 0.f) ? 1.f / c : 1.f;
+      const float inv = ls_eval_vignette_factor(&p, xu + (float)col, y);
       /* All FOUR components, alpha included: upstream's apply_multiplier under
        * LF_CR_4(RED,GREEN,BLUE,UNKNOWN) multiplies the UNKNOWN channel too, and the
        * harness caught the difference on literally every sampled pixel (k=3,7,11...).
