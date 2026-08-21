@@ -75,10 +75,26 @@
 #define LS_EVAL_VIG_NONE 0
 #define LS_EVAL_VIG_PA   1
 
+/** Half the diagonal of a 36x24 frame, in mm: sqrt(36^2+24^2)/2. The projection focal is
+ * expressed against it -- see ls_modifier_init(), which is where the conversion lives. */
+#define LS_EVAL_FULL_FRAME_HALF_DIAG_MM 21.633307f
+
+/* Mirrors of ls_lens_type_t, for the same reason as the model mirrors above. */
+#define LS_EVAL_LENS_UNKNOWN                0
+#define LS_EVAL_LENS_RECTILINEAR            1
+#define LS_EVAL_LENS_FISHEYE                2
+#define LS_EVAL_LENS_PANORAMIC              3
+#define LS_EVAL_LENS_EQUIRECTANGULAR        4
+#define LS_EVAL_LENS_FISHEYE_ORTHOGRAPHIC   5
+#define LS_EVAL_LENS_FISHEYE_STEREOGRAPHIC  6
+#define LS_EVAL_LENS_FISHEYE_EQUISOLID      7
+#define LS_EVAL_LENS_FISHEYE_THOBY          8
+
 #define LS_EVAL_ENABLE_DISTORTION (1 << 0)
 #define LS_EVAL_ENABLE_TCA        (1 << 1)
 #define LS_EVAL_ENABLE_VIGNETTING (1 << 2)
 #define LS_EVAL_ENABLE_SCALE      (1 << 3)
+#define LS_EVAL_ENABLE_GEOMETRY   (1 << 4)
 
 /**
  * @brief One lens resolved at one shooting configuration, as a flat block of scalars.
@@ -102,6 +118,10 @@ typedef struct ls_eval_t
   int   tca_model;               /**< LS_EVAL_TCA_* */
   int   vig_model;               /**< LS_EVAL_VIG_* */
   int   enabled;                 /**< LS_EVAL_ENABLE_* actually resolved */
+  int   geom_from;               /**< the lens's own projection, LS_EVAL_LENS_* */
+  int   geom_to;                 /**< the projection asked for */
+  float geom_focal;              /**< focal / LS_EVAL_GEOM_HALF_HEIGHT_MM */
+  float _pad;                    /**< keeps the struct 4-aligned and its size stated */
   float dist_terms[3];
   float tca_terms[6];
   float vig_terms[3];
@@ -174,18 +194,96 @@ static inline void ls_eval_tca(const ls_eval_t *p, float *xr, float *yr, float *
  * the kernel agree bit for bit rather than merely closely. Do not "optimise" this into
  * taking an origin plus an index: the two would then round differently.
  */
+/**
+ * @brief Field angle for a radius, under one projection. Negative if @p model has none.
+ *
+ * @details The destination half of a projection change: the output image is in @p model's
+ * geometry, and this recovers the angle the ray came in at. Radii outside a projection's
+ * domain (a fisheye only maps so far) return -1 so the caller can leave the pixel black
+ * rather than fold the image back on itself.
+ */
+static inline float ls_eval_geom_angle(const int model, const float f, const float r)
+{
+  if(f <= 0.f) return -1.f;
+  switch(model)
+  {
+    case LS_EVAL_LENS_RECTILINEAR:           return atan(r / f);
+    case LS_EVAL_LENS_FISHEYE:               return r / f;
+    case LS_EVAL_LENS_FISHEYE_ORTHOGRAPHIC:  return (r <= f) ? asin(r / f) : -1.f;
+    case LS_EVAL_LENS_FISHEYE_STEREOGRAPHIC: return 2.f * atan(r / (2.f * f));
+    case LS_EVAL_LENS_FISHEYE_EQUISOLID:     return (r <= 2.f * f) ? 2.f * asin(r / (2.f * f)) : -1.f;
+    case LS_EVAL_LENS_FISHEYE_THOBY:
+      return (r <= 1.47f * f) ? asin(r / (1.47f * f)) / 0.713f : -1.f;
+    default: return -1.f;   /* panoramic and equirectangular are not radial; see the header */
+  }
+}
+
+/** @brief Radius for a field angle, under one projection. The inverse of the above. */
+static inline float ls_eval_geom_radius(const int model, const float f, const float theta)
+{
+  if(f <= 0.f || theta < 0.f) return -1.f;
+  switch(model)
+  {
+    case LS_EVAL_LENS_RECTILINEAR:
+      /* Beyond a right angle a rectilinear lens images nothing: tan() would silently wrap
+       * a point behind the camera round to the front. */
+      return (theta < 1.5707963f) ? f * tan(theta) : -1.f;
+    case LS_EVAL_LENS_FISHEYE:               return f * theta;
+    case LS_EVAL_LENS_FISHEYE_ORTHOGRAPHIC:  return f * sin(theta);
+    case LS_EVAL_LENS_FISHEYE_STEREOGRAPHIC: return 2.f * f * tan(theta * 0.5f);
+    case LS_EVAL_LENS_FISHEYE_EQUISOLID:     return 2.f * f * sin(theta * 0.5f);
+    case LS_EVAL_LENS_FISHEYE_THOBY:         return 1.47f * f * sin(0.713f * theta);
+    default: return -1.f;
+  }
+}
+
+/**
+ * @brief Reproject one point from the target geometry into the lens's own.
+ *
+ * @details Radially symmetric, so it scales x and y by one factor rather than mapping them
+ * separately -- which is exactly why panoramic and equirectangular are excluded: those two
+ * treat the axes differently and cannot be expressed this way.
+ *
+ * @return 0 if the point has no source (outside the projection's domain), 1 otherwise.
+ */
+static inline int ls_eval_geometry(const ls_eval_t *p, float *x, float *y)
+{
+  const float r = LS_SQRT((*x) * (*x) + (*y) * (*y));
+  if(r <= 0.f) return 1;                       /* the centre maps to itself */
+
+  const float theta = ls_eval_geom_angle(p->geom_to, p->geom_focal, r);
+  if(theta < 0.f) return 0;
+  const float r_src = ls_eval_geom_radius(p->geom_from, p->geom_focal, theta);
+  if(r_src < 0.f) return 0;
+
+  const float k = r_src / r;
+  *x *= k;
+  *y *= k;
+  return 1;
+}
+
 static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *out)
 {
   float x = xu * p->norm_scale - p->center_x;
   float y = yu * p->norm_scale - p->center_y;
 
-  /* lensfun's callback-priority order for the correction direction:
-   * scaling (100) -> [projection: not implemented, reported by the caller] -> distortion
-   * (750), then the TCA subpixel stage per channel. */
+  /* lensfun's callback-priority order for the correction direction: scaling (100) ->
+   * projection (500) -> distortion (750), then the TCA subpixel stage per channel. */
   if(p->enabled & LS_EVAL_ENABLE_SCALE)
   {
     x *= p->scale;
     y *= p->scale;
+  }
+  if(p->enabled & LS_EVAL_ENABLE_GEOMETRY)
+  {
+    if(!ls_eval_geometry(p, &x, &y))
+    {
+      /* No source pixel. NaN is what lensfun writes here too, and every consumer in this
+       * project already checks for it (do_nan_checks in the kernels, isfinite() on the
+       * CPU) before sampling. */
+      for(int k = 0; k < 6; k++) out[k] = (float)(0.0f / 0.0f);
+      return;
+    }
   }
   if(p->enabled & LS_EVAL_ENABLE_DISTORTION) ls_eval_dist(p, &x, &y);
 

@@ -116,6 +116,7 @@ typedef struct ls_lens_t
 #define LS_ENABLE_TCA        (1 << 1)
 #define LS_ENABLE_VIGNETTING (1 << 2)
 #define LS_ENABLE_SCALE      (1 << 3)
+#define LS_ENABLE_GEOMETRY   (1 << 4)
 
 /**
  * @brief A modifier: the lens resolved at one shooting configuration.
@@ -135,9 +136,14 @@ typedef struct ls_modifier_t
   float width, height;        /* the (dimension − 1) values, lensfun's own convention */
 
   int   enabled;              /* LS_ENABLE_* actually resolved (calibration present) */
-  int   geometry_unsupported; /* lens type ≠ rectilinear would need a projection stage */
+  /* Set when the requested projection change cannot be expressed radially -- panoramic or
+   * equirectangular on either side. Those two map x and y differently; everything else
+   * (rectilinear, the four fisheyes, thoby) goes through ls_eval_geometry(). */
+  int   geometry_unsupported;
 
   float scale;                /* linear scaling factor, applied first (priority 100) */
+  int   geom_from, geom_to;   /* projection change, ls_lens_type_t (priority 500) */
+  float geom_focal;           /* focal / 12mm, the normalized-radius reference */
   ls_calib_dist_t dist;       /* resolved (interpolated) at the shooting focal */
   ls_calib_tca_t  tca;
   ls_calib_vig_t  vig;
@@ -145,12 +151,16 @@ typedef struct ls_modifier_t
 
 /**
  * @brief Resolve a lens at one (crop, geometry, focal, aperture, distance, scale).
+ *
+ * @param target_type the projection the output should be in, as ls_lens_type_t. Pass the
+ * lens's own type (or LS_LENS_UNKNOWN) for no projection change; LS_ENABLE_GEOMETRY is
+ * only raised when it actually differs and the pair is radially expressible.
  * @return the LS_ENABLE_* flags actually in effect, mirroring lensfun's oflags.
  */
 int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                      float crop, int width, int height,
                      float focal, float aperture, float distance,
-                     float scale, int flags);
+                     float scale, int target_type, int flags);
 
 /**
  * @brief Flatten a resolved modifier into the scalar block a kernel can take by value.

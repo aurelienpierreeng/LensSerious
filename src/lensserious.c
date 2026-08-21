@@ -216,7 +216,7 @@ static int _interp_vig(const ls_lens_t *lens, float focal, float aperture, float
 int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                      float crop, int width, int height,
                      float focal, float aperture, float distance,
-                     float scale, int flags)
+                     float scale, int target_type, int flags)
 {
   memset(mod, 0, sizeof(*mod));
   if(!lens || crop <= 0.f) return 0;
@@ -244,9 +244,56 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
   mod->center_x = (w / size + lens->center_x) * coordinate_correction;
   mod->center_y = (h / size + lens->center_y) * coordinate_correction;
 
-  mod->geometry_unsupported = (lens->type != LS_LENS_RECTILINEAR && lens->type != LS_LENS_UNKNOWN);
+  /* A projection change is radial for every type except panoramic and equirectangular,
+   * which treat the axes differently (see ls_eval_geometry()). Report those rather than
+   * approximate them. */
+  const int from = (int)lens->type;
+  const int to = (target_type == LS_LENS_UNKNOWN) ? from : target_type;
+  const int radial = (from != LS_LENS_PANORAMIC && from != LS_LENS_EQUIRECTANGULAR
+                      && to != LS_LENS_PANORAMIC && to != LS_LENS_EQUIRECTANGULAR
+                      && from != LS_LENS_UNKNOWN && to != LS_LENS_UNKNOWN);
+  mod->geom_from = from;
+  mod->geom_to = to;
+  /* The projection focal, in the same normalized units as a radius.
+   *
+   * MEASURED, not derived: liblensfun's own geometry callback was fitted over lenses
+   * spanning crop factors 1.0 to 7.66 and aspect ratios 1.143 to 1.5, and
+   *
+   *     f_norm = focal * lens_crop_factor * sqrt(ar^2 + 1) / 21.633307
+   *
+   * reproduces all of them to five digits. The denominator is half the diagonal of a
+   * 36x24 frame, so the numerator is that diagonal reduced to the CALIBRATION sensor and
+   * then to its short side -- which is what normalized radius 1.0 means here.
+   *
+   * The SHOOTING crop deliberately does not appear: it is already inside norm_scale, and
+   * a first version that used a bare focal/12 (fitted on 3:2 lenses alone, where the two
+   * happen to coincide) was out by 284 px on a 4:3 compact. */
+  mod->geom_focal = focal * lens->crop_factor * aspect_ratio_correction
+                    / LS_EVAL_FULL_FRAME_HALF_DIAG_MM;
+  mod->geometry_unsupported = (from != to) && !radial;
+
+  /* A projection change is only offered where it has been VERIFIED, which is on its own.
+   *
+   * ls_eval_geometry() reproduces liblensfun's geometry callback exactly -- 0.000 px over
+   * the whole radius range, on the worst lens the harness could find, with the focal
+   * constant fitted across crop factors 1.0 to 7.66 and aspect ratios 1.143 to 1.5.
+   *
+   * Composing it with a distortion calibration is NOT understood. Applying the two in the
+   * order lensfun's documented callback priorities imply (geometry 500 before distortion
+   * 750) is 28 px out at the centre of the frame and 135 px at the edge; applying them in
+   * the reverse order -- which lensfun's own header hints at, since it says scaling comes
+   * first "no matter if we're doing a forward or reverse transform" -- agrees to 0.03 px
+   * near the axis and is worse overall (551k samples out of tolerance against 140k). So
+   * neither is right, and the difference is not a tolerance question.
+   *
+   * Until that is measured, a lens that has both keeps reporting geometry_unsupported and
+   * its caller keeps falling back to lensfun, exactly as before this stage existed. The
+   * alternative is shipping a projection that is confidently wrong by 135 px. */
+  const int has_distortion = (lens->n_dist > 0);
+  if(from != to && radial && has_distortion) mod->geometry_unsupported = 1;
 
   int enabled = 0;
+  if(from != to && radial && !has_distortion && focal > 0.f) enabled |= LS_ENABLE_GEOMETRY;
   if((flags & LS_ENABLE_DISTORTION) && _interp_dist(lens, focal, &mod->dist))
     enabled |= LS_ENABLE_DISTORTION;
   if((flags & LS_ENABLE_TCA) && _interp_tca(lens, focal, &mod->tca))
@@ -290,12 +337,19 @@ _Static_assert(LS_ENABLE_DISTORTION == LS_EVAL_ENABLE_DISTORTION, "enable bit mi
 _Static_assert(LS_ENABLE_TCA        == LS_EVAL_ENABLE_TCA,        "enable bit mirror drifted");
 _Static_assert(LS_ENABLE_VIGNETTING == LS_EVAL_ENABLE_VIGNETTING, "enable bit mirror drifted");
 _Static_assert(LS_ENABLE_SCALE      == LS_EVAL_ENABLE_SCALE,      "enable bit mirror drifted");
+_Static_assert(LS_ENABLE_GEOMETRY   == LS_EVAL_ENABLE_GEOMETRY,   "enable bit mirror drifted");
+_Static_assert((int)LS_LENS_RECTILINEAR == LS_EVAL_LENS_RECTILINEAR, "lens type mirror drifted");
+_Static_assert((int)LS_LENS_FISHEYE_THOBY == LS_EVAL_LENS_FISHEYE_THOBY, "lens type mirror drifted");
 
 /* ls_eval_t crosses to the device as a by-value kernel argument, so host and device must
  * lay it out identically. Scalars only is what guarantees that; this pins the consequence
  * so adding a float2 (or a double, or a bool) fails to build instead of corrupting every
  * field after it. */
-_Static_assert(sizeof(ls_eval_t) == 6 * sizeof(float) + 4 * sizeof(int) + 12 * sizeof(float),
+_Static_assert(sizeof(ls_eval_t) == 6 * sizeof(float)      /* the coordinate system */
+                                  + 4 * sizeof(int)        /* model ids and enable bits */
+                                  + 2 * sizeof(int)        /* geom_from, geom_to */
+                                  + 2 * sizeof(float)      /* geom_focal, _pad */
+                                  + 12 * sizeof(float),    /* the terms */
                "ls_eval_t gained padding or a member: check it is still scalar-only");
 _Static_assert(_Alignof(ls_eval_t) == _Alignof(float), "ls_eval_t alignment is no longer 4");
 
@@ -315,6 +369,9 @@ int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
   out->dist_model = (int)mod->dist.model;
   out->tca_model = (int)mod->tca.model;
   out->vig_model = (int)mod->vig.model;
+  out->geom_from = mod->geom_from;
+  out->geom_to = mod->geom_to;
+  out->geom_focal = mod->geom_focal;
 
   for(int i = 0; i < 3; i++) out->dist_terms[i] = mod->dist.terms[i];
   for(int i = 0; i < 6; i++) out->tca_terms[i] = mod->tca.terms[i];

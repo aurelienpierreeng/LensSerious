@@ -42,11 +42,22 @@ unsigned int _ls_no_cpu_features(void) { return 0; }
 static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
 {
   memset(out, 0, sizeof(*out));
+  /* Faithful, one type to one type. This used to collapse everything non-rectilinear to
+   * LS_LENS_FISHEYE, which was harmless only because those lenses were then skipped
+   * entirely. Now that the projection stage exists and they are compared, telling an
+   * equisolid lens it is an equidistant one is a 127 px error in the harness, not in the
+   * library -- which is exactly how it presented. */
   switch(lf->Type)
   {
-    case LF_RECTILINEAR: out->type = LS_LENS_RECTILINEAR; break;
-    case LF_UNKNOWN:     out->type = LS_LENS_UNKNOWN; break;
-    default:             out->type = LS_LENS_FISHEYE; break; /* any non-rectilinear: skip */
+    case LF_RECTILINEAR:           out->type = LS_LENS_RECTILINEAR; break;
+    case LF_FISHEYE:               out->type = LS_LENS_FISHEYE; break;
+    case LF_PANORAMIC:             out->type = LS_LENS_PANORAMIC; break;
+    case LF_EQUIRECTANGULAR:       out->type = LS_LENS_EQUIRECTANGULAR; break;
+    case LF_FISHEYE_ORTHOGRAPHIC:  out->type = LS_LENS_FISHEYE_ORTHOGRAPHIC; break;
+    case LF_FISHEYE_STEREOGRAPHIC: out->type = LS_LENS_FISHEYE_STEREOGRAPHIC; break;
+    case LF_FISHEYE_EQUISOLID:     out->type = LS_LENS_FISHEYE_EQUISOLID; break;
+    case LF_FISHEYE_THOBY:         out->type = LS_LENS_FISHEYE_THOBY; break;
+    default:                       out->type = LS_LENS_UNKNOWN; break;
   }
   out->crop_factor = lf->CropFactor;
   out->min_focal = lf->MinFocal;
@@ -131,7 +142,20 @@ int main(int argc, char **argv)
 
     ls_lens_t lens;
     if(!_lens_from_lf(lf, &lens)) continue;
-    if(lens.type != LS_LENS_RECTILINEAR && lens.type != LS_LENS_UNKNOWN)
+    /* Every lens is compared now, projection change included -- the target below is
+     * rectilinear, so a fisheye exercises ls_eval_geometry() against lensfun's own
+     * geometry callback. Only panoramic and equirectangular are left out: those two map x
+     * and y differently and LensSerious says so rather than approximating them. */
+    /* Projection changes are exercised wherever LensSerious offers one. It declines when
+     * the lens also carries a distortion calibration (see ls_modifier_init) and when the
+     * pair is not radially expressible, and those lenses are counted here rather than
+     * compared -- the fallback path is what runs for them. */
+    if(lens.type != LS_LENS_RECTILINEAR && lens.type != LS_LENS_UNKNOWN && lens.n_dist > 0)
+    {
+      skipped_geometry++;
+      continue;
+    }
+    if(lens.type == LS_LENS_PANORAMIC || lens.type == LS_LENS_EQUIRECTANGULAR)
     {
       skipped_geometry++;
       continue;
@@ -156,12 +180,15 @@ int main(int argc, char **argv)
       lfModifier *ref = lf_modifier_new(lf, crop, W, H);
       const int refmods = lf_modifier_initialize(ref, lf, LF_PF_F32, focal, 8.f, 1000.f, 1.f,
                                                  LF_RECTILINEAR,
-                                                 LF_MODIFY_DISTORTION | LF_MODIFY_TCA, 0);
+                                                 LF_MODIFY_DISTORTION | LF_MODIFY_TCA
+                                                     | LF_MODIFY_GEOMETRY, 0);
       ls_modifier_t mod;
       const int mymods = ls_modifier_init(&mod, &lens, crop, W, H, focal, 8.f, 1000.f, 1.f,
-                                          LS_ENABLE_DISTORTION | LS_ENABLE_TCA);
+                                          LS_LENS_RECTILINEAR,
+                                          LS_ENABLE_DISTORTION | LS_ENABLE_TCA
+                                              | LS_ENABLE_GEOMETRY);
 
-      if((refmods & (LF_MODIFY_DISTORTION | LF_MODIFY_TCA)) && mymods)
+      if((refmods & (LF_MODIFY_DISTORTION | LF_MODIFY_TCA | LF_MODIFY_GEOMETRY)) && mymods)
       {
         compared++;
         /* Full-row call: upstream walks rows by float accumulation (x += NormScale), and a
@@ -217,6 +244,7 @@ int main(int argc, char **argv)
                                                   LF_RECTILINEAR, LF_MODIFY_VIGNETTING, 0);
       ls_modifier_t vmod;
       const int vmymods = ls_modifier_init(&vmod, &lens, crop, W, H, focal, 8.f, 1000.f, 1.f,
+                                          LS_LENS_UNKNOWN,
                                            LS_ENABLE_VIGNETTING);
       if((vrefmods & LF_MODIFY_VIGNETTING) && (vmymods & LS_ENABLE_VIGNETTING))
       {
@@ -262,7 +290,7 @@ int main(int argc, char **argv)
   lf_db_destroy(ldb);
 
   printf("parity: %d lenses total, %d geometry-compared, %d skipped (projection not yet"
-         " implemented), %d vignetting-compared\n", total, compared, skipped_geometry, vig_compared);
+         " offered), %d vignetting-compared\n", total, compared, skipped_geometry, vig_compared);
   printf("parity: worst geometry delta %.6f px (%s); grid tol %.3f px, rows held to upstream's"
          " SSE approximation envelope -> %s\n",
          worst_px, worst_name, TOL_GEOMETRY_PX, failed ? "FAIL" : "pass");
