@@ -30,6 +30,26 @@ if(LENSSERIOUS_DB)
   endif()
 endif()
 
+# liblensfun, found once and used by two different things below: the offline importer,
+# which is a TOOL a consumer needs in order to have a database at all, and the parity
+# harnesses, which are tests. The importer used to live inside the test block, which meant
+# -DLENSSERIOUS_TESTS=OFF silently removed the only way to build a database -- exactly what
+# a consumer embedding this library wants to turn off.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  pkg_check_modules(LENSFUN IMPORTED_TARGET lensfun)
+endif()
+
+# The importer reads the XML through liblensfun on purpose -- see the file header. It is an
+# offline tool run when upstream publishes calibrations, so that dependency never reaches a
+# render: nothing the pixel pipeline links to knows lensfun exists.
+if(LENSFUN_FOUND AND TARGET lensserious_db)
+  add_executable(import_lensfun_xml tools/import_lensfun_xml.c)
+  target_link_libraries(import_lensfun_xml PRIVATE lensserious_db PkgConfig::LENSFUN)
+  target_compile_options(import_lensfun_xml PRIVATE -Wall -Wextra)
+  set_target_properties(import_lensfun_xml PROPERTIES C_STANDARD 11)
+endif()
+
 option(LENSSERIOUS_TESTS "Build the lensfun parity harness" ON)
 # Every parity, oracle and benchmark target needs liblensfun, and the whole point of this
 # repository's CI is that they RUN. Finding lensfun is therefore optional for a developer
@@ -77,14 +97,7 @@ if(LENSSERIOUS_TESTS)
     target_link_options(parity_lensfun PRIVATE -Wl,--export-dynamic)
     add_test(NAME parity COMMAND parity_lensfun)
 
-    # The importer reads the XML through liblensfun on purpose -- see the file header. It
-    # is an offline tool, so that dependency never reaches a render.
-    if(TARGET lensserious_db)
-      add_executable(import_lensfun_xml tools/import_lensfun_xml.c)
-      target_link_libraries(import_lensfun_xml PRIVATE lensserious_db PkgConfig::LENSFUN)
-      target_compile_options(import_lensfun_xml PRIVATE -Wall -Wextra)
-      set_target_properties(import_lensfun_xml PROPERTIES C_STANDARD 11)
-
+    if(TARGET import_lensfun_xml)
       add_executable(parity_db tests/parity_db.c)
       target_link_libraries(parity_db PRIVATE lensserious_db PkgConfig::LENSFUN)
       target_compile_options(parity_db PRIVATE -Wall -Wextra)
