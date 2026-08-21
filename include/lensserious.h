@@ -186,6 +186,11 @@ typedef struct ls_modifier_t
  * TCA with a zero term -- is dropped from the returned flags exactly as upstream drops it.
  * @return the LS_ENABLE_* flags actually in effect, mirroring lensfun's oflags.
  */
+int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
+                     float crop, int width, int height,
+                     float focal, float aperture, float distance,
+                     float scale, int target_type, int flags, int reverse);
+
 /**
  * @brief The scale that just removes the black borders a correction leaves behind.
  *
@@ -211,11 +216,6 @@ typedef struct ls_modifier_t
  * upstream lets the iteration fail and the point simply loses the max(). Same here.
  */
 float ls_modifier_autoscale(const ls_modifier_t *mod);
-
-int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
-                     float crop, int width, int height,
-                     float focal, float aperture, float distance,
-                     float scale, int target_type, int flags, int reverse);
 
 /**
  * @brief Flatten a resolved modifier into the scalar block a kernel can take by value.
