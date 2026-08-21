@@ -1,0 +1,13 @@
+name: CI
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  parity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install lensfun (library + database)
+        run: sudo apt-get update && sudo apt-get install -y liblensfun-dev liblensfun-data-v1 pkg-config cmake ninja-build
+      - name: Build
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build
+      - name: Parity against the full database
+        run: ./build/parity_lensfun
