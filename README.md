@@ -160,10 +160,22 @@ where `mm` or `f` reaches thousands — and gather only those, falling back to t
 if that finds nothing, so the answer never depends on the pruning. 2.89 ms → 0.19 ms, with
 agreement unchanged at 99.0%.
 
-Two things were tried, measured, and are deliberately *not* in the code: gathering on **all**
-the query's tokens (no better than the scan it replaces), and hashing the tokens to compare
-them faster (moved nothing — the per-comparison cost was already ~5 ns; there were simply
-half a million comparisons).
+Three things were tried, measured, and are deliberately *not* in the code:
+
+- gathering candidates on **all** the query's tokens — no better than the scan it replaces,
+  since `mm`, `f`, `ed`, `vr` are in most names;
+- **hashing the tokens** to compare them faster — moved nothing. The per-comparison cost was
+  already ~5 ns; there were simply half a million comparisons;
+- **resolving the brand first**, to split the space before matching the model. The database
+  says the opposite: the query's rarest model token (`16`) reaches 55 lenses where the maker
+  (`nikon`) reaches 238, so the token already prunes 4.3× harder. As a *second* filter it is
+  worse still — an `EXISTS` on the maker returns 12× fewer rows and takes twice as long
+  (0.144 ms against 0.071 ms), because the correlated subquery costs more per candidate than
+  the candidates it removes. Requiring the maker would cost accuracy too: it is scored rather
+  than required precisely because vendors and upstream disagree about vendors' own names.
+
+What remains is spread thin — scoring 21%, SQLite 28% over two queries, tokenising 8% — at
+~2 ns per token comparison, with no single error left. 5.6× lensfun, from 96×.
 
 **Vignetting** was 1.8× *slower* until the divides were counted. Three causes, worth
 recording because two of them are not about arithmetic: the half-diagonal coordinate system
