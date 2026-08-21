@@ -11,6 +11,25 @@ if(NOT MSVC)
 endif()
 set_target_properties(lensserious PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
 
+# The database is an OPTIONAL component: the evaluators above stay dependency-free, since
+# they are what ends up inside a pixel pipeline. Only the lookup half needs SQLite.
+option(LENSSERIOUS_DB "Build the SQLite database reader and importer" ON)
+if(LENSSERIOUS_DB)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(SQLITE3 IMPORTED_TARGET sqlite3)
+  endif()
+  if(SQLITE3_FOUND)
+    add_library(lensserious_db STATIC src/lensserious_db.c)
+    target_include_directories(lensserious_db PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(lensserious_db PUBLIC lensserious PkgConfig::SQLITE3)
+    target_compile_options(lensserious_db PRIVATE -Wall -Wextra)
+    set_target_properties(lensserious_db PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+  else()
+    message(STATUS "sqlite3 not found: the database reader will not be built")
+  endif()
+endif()
+
 option(LENSSERIOUS_TESTS "Build the lensfun parity harness" ON)
 if(LENSSERIOUS_TESTS)
   enable_testing()
@@ -44,6 +63,27 @@ if(LENSSERIOUS_TESTS)
     # path; the executable must export its symbols for the interposition to bind.
     target_link_options(parity_lensfun PRIVATE -Wl,--export-dynamic)
     add_test(NAME parity COMMAND parity_lensfun)
+
+    # The importer reads the XML through liblensfun on purpose -- see the file header. It
+    # is an offline tool, so that dependency never reaches a render.
+    if(TARGET lensserious_db)
+      add_executable(import_lensfun_xml tools/import_lensfun_xml.c)
+      target_link_libraries(import_lensfun_xml PRIVATE lensserious_db PkgConfig::LENSFUN)
+      target_compile_options(import_lensfun_xml PRIVATE -Wall -Wextra)
+      set_target_properties(import_lensfun_xml PROPERTIES C_STANDARD 11)
+
+      add_executable(parity_db tests/parity_db.c)
+      target_link_libraries(parity_db PRIVATE lensserious_db PkgConfig::LENSFUN)
+      target_compile_options(parity_db PRIVATE -Wall -Wextra)
+      set_target_properties(parity_db PROPERTIES C_STANDARD 11)
+      # Rebuild the database from the system XML, then hold it to liblensfun's own answer.
+      add_test(NAME db_import
+               COMMAND import_lensfun_xml ${CMAKE_CURRENT_SOURCE_DIR}/src/schema.sql
+                       ${CMAKE_CURRENT_BINARY_DIR}/lenses.db)
+      add_test(NAME db_parity COMMAND parity_db ${CMAKE_CURRENT_BINARY_DIR}/lenses.db)
+      set_tests_properties(db_import PROPERTIES FIXTURES_SETUP LENSDB)
+      set_tests_properties(db_parity PROPERTIES FIXTURES_REQUIRED LENSDB)
+    endif()
   else()
     message(STATUS "lensfun not found: the parity harness will not be built here")
   endif()
