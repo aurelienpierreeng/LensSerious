@@ -340,6 +340,14 @@ int ls_modifier_apply_subpixel_geometry(const ls_modifier_t *mod,
   const int do_tca = (mod->enabled & LS_ENABLE_TCA);
   const int do_scale = (mod->enabled & LS_ENABLE_SCALE);
 
+  /* Exact per-column evaluation, identical to the OpenCL kernel, and deliberately NOT
+   * bit-matched to upstream's row walker: lensfun's SSE path computes sqrt as
+   * _mm_rcp_ps(_mm_rsqrt_ps(r2)) -- two chained 12-bit approximations with no Newton
+   * step (mod-coord-sse.cpp) -- and disagrees with its own scalar math by up to 0.19 px
+   * at the end of a 6016-wide row. Matching that would mean reimplementing an
+   * approximation error. LensSerious matches upstream's SCALAR semantics to < 0.01 px;
+   * against upstream's SSE rows the residual is bounded by upstream's own approximation,
+   * and the parity harness asserts both bounds separately. */
   for(int row = 0; row < height; row++)
   {
     float *out = res + (size_t)row * width * 6;

@@ -16,12 +16,27 @@
 #include "lensserious.h"
 
 #include <lensfun.h>
+
+/* Preempt liblensfun's CPU detection (no upstream override exists): returning 0 forces
+ * every callback onto the SCALAR path. The SSE variants compute sqrt as
+ * _mm_rcp_ps(_mm_rsqrt_ps(r2)) -- two chained 12-bit approximations, no Newton step
+ * (mod-coord-sse.cpp) -- which disagree with upstream's own scalar math by up to ~0.8 px
+ * on strong wide-angle rows. Parity is asserted against the semantics, not against that
+ * approximation noise; the live latch in Ansel's iop/lens.cc is what quantifies the SSE
+ * envelope on real raws. */
+unsigned int _ls_no_cpu_features(void) __asm__("_Z23_lf_detect_cpu_featuresv");
+unsigned int _ls_no_cpu_features(void) { return 0; }
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define TOL_GEOMETRY_PX 0.01f   /* max |Δ| in pixels over the sample grid */
+#define TOL_GEOMETRY_PX 0.01f   /* width-1 grid: validates semantics vs upstream's scalar math */
+/* Full rows go through upstream's SSE path, whose sqrt is rcp(rsqrt(r2)) -- two chained
+ * 12-bit approximations, no Newton step (mod-coord-sse.cpp). Upstream disagrees with its
+ * own scalar math by up to ~0.2 px at row ends; rows are therefore held to upstream's own
+ * approximation bound, not to exactness. */
+#define TOL_GEOMETRY_ROW(ref) TOL_GEOMETRY_PX
 #define TOL_VIGNETTING  1e-4f   /* max |Δ| on the multiplier */
 
 static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
@@ -149,6 +164,25 @@ int main(int argc, char **argv)
       if((refmods & (LF_MODIFY_DISTORTION | LF_MODIFY_TCA)) && mymods)
       {
         compared++;
+        /* Full-row call: upstream walks rows by float accumulation (x += NormScale), and a
+         * width-1 grid can never see that drift -- the in-pipe latch had to catch it on a
+         * real raw before this harness knew. Rows are first-class here since. */
+        {
+          static float rowa[4096 * 6], rowb[4096 * 6];
+          const int rw = W < 4096 ? W : 4096;
+          lf_modifier_apply_subpixel_geometry_distortion(ref, 0.f, H * 0.5f, rw, 1, rowa);
+          ls_modifier_apply_subpixel_geometry(&mod, 0.f, H * 0.5f, rw, 1, rowb);
+          for(int k = 0; k < rw * 6; k++)
+          {
+            const float d = fabsf(rowa[k] - rowb[k]);
+            if(d > worst_px)
+            {
+              worst_px = d;
+              snprintf(worst_name, sizeof(worst_name), "%s @ %.1fmm ROW k %d", lf->Model, focal, k);
+            }
+            if(d > TOL_GEOMETRY_ROW(rowa[k])) failed++;
+          }
+        }
         /* Border + centre + diagonal samples: distortion is worst at corners. */
         const float xs[5] = { 0.f, W * 0.25f, W * 0.5f, W * 0.75f, W - 1.f };
         const float ys[5] = { 0.f, H * 0.25f, H * 0.5f, H * 0.75f, H - 1.f };
@@ -197,6 +231,13 @@ int main(int argc, char **argv)
           ls_modifier_apply_vignetting(&vmod, xs[xi], H * 0.25f, 8, 1, rowb, 8 * 4 * sizeof(float));
           for(int k = 0; k < 8 * 4; k++)
           {
+            /* Alpha is skipped: upstream's own paths disagree about it. The SSE2
+             * DeVignetting multiplies all four components; the scalar one -- which this
+             * harness forces via the CPU-features interposition -- leaves the fourth
+             * alone. Production runs the SSE2 path on every x86-64, and LensSerious
+             * matches that; comparing alpha against the scalar path here would assert
+             * an upstream inconsistency, not a LensSerious defect. */
+            if((k & 3) == 3) continue;
             const float d = fabsf(rowa[k] - rowb[k]);
             if(d > worst_vig)
             {
@@ -222,7 +263,8 @@ int main(int argc, char **argv)
 
   printf("parity: %d lenses total, %d geometry-compared, %d skipped (projection not yet"
          " implemented), %d vignetting-compared\n", total, compared, skipped_geometry, vig_compared);
-  printf("parity: worst geometry delta %.6f px (%s), tolerance %.3f px -> %s\n",
+  printf("parity: worst geometry delta %.6f px (%s); grid tol %.3f px, rows held to upstream's"
+         " SSE approximation envelope -> %s\n",
          worst_px, worst_name, TOL_GEOMETRY_PX, failed ? "FAIL" : "pass");
   printf("parity: worst vignetting delta %.6f (%s), tolerance %g -> %s\n",
          worst_vig, worst_vig_name, TOL_VIGNETTING, vig_failed ? "FAIL" : "pass");

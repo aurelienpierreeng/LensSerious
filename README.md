@@ -43,6 +43,22 @@ Two instruments hold that line:
   lensfun **and** LensSerious simultaneously and logs the live per-frame deviation, so
   the comparison runs on real raws in the real pipeline until the day the two part ways.
 
+## What the parity work found in upstream
+
+Two genuine discoveries, both invisible to any width-1 test and caught only by comparing
+full rows in the real pipeline:
+
+- **Lensfun's SSE row path is ~0.2–0.8 px approximate.** Its SIMD variants compute
+  `sqrt(r²)` as `_mm_rcp_ps(_mm_rsqrt_ps(r²))` — two chained 12-bit approximations with no
+  Newton step (`mod-coord-sse.cpp`) — and disagree with lensfun's *own scalar math* by up
+  to 0.8 px at the end of wide rows on strong wide-angle lenses. Every lensfun-corrected
+  render carries that error. LensSerious evaluates exactly (identically on CPU and GPU) and
+  matches upstream's **scalar** semantics to < 0.01 px over the whole database; the parity
+  harness forces upstream onto its scalar path by interposing its CPU detection.
+- **Lensfun's two vignetting paths disagree about alpha.** The SSE2 `DeVignetting`
+  multiplies all four components; the scalar one leaves the fourth alone. LensSerious
+  matches the SSE2 behaviour, which is what production runs on every x86-64.
+
 ## Status
 
 | piece | state |

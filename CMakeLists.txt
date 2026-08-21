@@ -20,6 +20,9 @@ if(LENSSERIOUS_TESTS)
   if(LENSFUN_FOUND)
     add_executable(parity_lensfun tests/parity_lensfun.c)
     target_link_libraries(parity_lensfun PRIVATE lensserious PkgConfig::LENSFUN)
+    # The harness interposes liblensfun's (C++-mangled) CPU detection to force the scalar
+    # path; the executable must export its symbols for the interposition to bind.
+    target_link_options(parity_lensfun PRIVATE -Wl,--export-dynamic)
     enable_testing()
     add_test(NAME parity COMMAND parity_lensfun)
   else()
