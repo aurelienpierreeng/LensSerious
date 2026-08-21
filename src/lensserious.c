@@ -272,28 +272,31 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                     / LS_EVAL_FULL_FRAME_HALF_DIAG_MM;
   mod->geometry_unsupported = (from != to) && !radial;
 
-  /* A projection change is only offered where it has been VERIFIED, which is on its own.
+  /* A projection change is offered where the geometry FOCAL is known to be the nominal
+   * one, which is the whole database except the handful of lenses carrying
+   * <real-focal-length> data.
    *
-   * ls_eval_geometry() reproduces liblensfun's geometry callback exactly -- 0.000 px over
-   * the whole radius range, on the worst lens the harness could find, with the focal
-   * constant fitted across crop factors 1.0 to 7.66 and aspect ratios 1.143 to 1.5.
+   * lensfun's geometry callback runs on GetRealFocalLength(focal) divided by
+   * get_hugin_focal_correction(focal) (modifier.cpp). Without real-focal data the first
+   * multiplies the hugin factor in and the second divides it straight back out, so the
+   * result is exactly `focal` -- measured across every fisheye in the database, ratio
+   * 1.0000. With real-focal data they do not cancel and the focal becomes
+   * real_focal / hugin, which ls_lens_t does not carry the calibration points to compute.
    *
-   * Composing it with a distortion calibration is NOT understood. Applying the two in the
-   * order lensfun's documented callback priorities imply (geometry 500 before distortion
-   * 750) is 28 px out at the centre of the frame and 135 px at the edge; applying them in
-   * the reverse order -- which lensfun's own header hints at, since it says scaling comes
-   * first "no matter if we're doing a forward or reverse transform" -- agrees to 0.03 px
-   * near the axis and is worse overall (551k samples out of tolerance against 140k). So
-   * neither is right, and the difference is not a tolerance question.
+   * Getting that focal wrong is not subtle: on the Sigma 4.5mm circular fisheye, whose
+   * real focal is 4.533 against a nominal 4.5 and whose hugin factor is 2.13, using the
+   * nominal focal is 28 px out at the centre of the frame and 135 px at the edge. So those
+   * lenses fall back instead.
    *
-   * Until that is measured, a lens that has both keeps reporting geometry_unsupported and
-   * its caller keeps falling back to lensfun, exactly as before this stage existed. The
-   * alternative is shipping a projection that is confidently wrong by 135 px. */
-  const int has_distortion = (lens->n_dist > 0);
-  if(from != to && radial && has_distortion) mod->geometry_unsupported = 1;
+   * The composition ORDER is settled and is the one below: lensfun's correction chain is
+   * scale (100), geometry (500), distortion (750, ModifyCoord_Dist_* -- the 250 UnDist_*
+   * variants are the reverse direction), then TCA as a subpixel callback after every
+   * coordinate callback. An earlier reading of this file's own header suggested the
+   * reverse and was wrong. */
+  if(from != to && radial && lens->has_real_focal) mod->geometry_unsupported = 1;
 
   int enabled = 0;
-  if(from != to && radial && !has_distortion && focal > 0.f) enabled |= LS_ENABLE_GEOMETRY;
+  if(from != to && radial && !lens->has_real_focal && focal > 0.f) enabled |= LS_ENABLE_GEOMETRY;
   if((flags & LS_ENABLE_DISTORTION) && _interp_dist(lens, focal, &mod->dist))
     enabled |= LS_ENABLE_DISTORTION;
   if((flags & LS_ENABLE_TCA) && _interp_tca(lens, focal, &mod->tca))

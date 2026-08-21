@@ -65,6 +65,10 @@ static int _lens_from_lf(const lfLens *lf, ls_lens_t *out)
   out->aspect_ratio = lf->AspectRatio;
   out->center_x = lf->CenterX;
   out->center_y = lf->CenterY;
+  {
+    lfLensCalibRealFocal rf;
+    out->has_real_focal = lf_lens_interpolate_real_focal(lf, lf->MinFocal, &rf) ? 1 : 0;
+  }
 
   if(lf->CalibDistortion)
     for(int i = 0; lf->CalibDistortion[i] && out->n_dist < LS_MAX_CALIB; i++)
@@ -150,11 +154,6 @@ int main(int argc, char **argv)
      * the lens also carries a distortion calibration (see ls_modifier_init) and when the
      * pair is not radially expressible, and those lenses are counted here rather than
      * compared -- the fallback path is what runs for them. */
-    if(lens.type != LS_LENS_RECTILINEAR && lens.type != LS_LENS_UNKNOWN && lens.n_dist > 0)
-    {
-      skipped_geometry++;
-      continue;
-    }
     if(lens.type == LS_LENS_PANORAMIC || lens.type == LS_LENS_EQUIRECTANGULAR)
     {
       skipped_geometry++;
@@ -187,6 +186,16 @@ int main(int argc, char **argv)
                                           LS_LENS_RECTILINEAR,
                                           LS_ENABLE_DISTORTION | LS_ENABLE_TCA
                                               | LS_ENABLE_GEOMETRY);
+
+      /* LensSerious declining a projection change is not a disagreement -- it is the
+       * fallback path doing its job. Count it and move on rather than comparing a
+       * corrected image against an uncorrected one. */
+      if(mod.geometry_unsupported)
+      {
+        skipped_geometry++;
+        lf_modifier_destroy(ref);
+        continue;
+      }
 
       if((refmods & (LF_MODIFY_DISTORTION | LF_MODIFY_TCA | LF_MODIFY_GEOMETRY)) && mymods)
       {
@@ -266,6 +275,7 @@ int main(int argc, char **argv)
              * matches that; comparing alpha against the scalar path here would assert
              * an upstream inconsistency, not a LensSerious defect. */
             if((k & 3) == 3) continue;
+
             const float d = fabsf(rowa[k] - rowb[k]);
             if(d > worst_vig)
             {

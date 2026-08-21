@@ -107,6 +107,16 @@ typedef struct ls_lens_t
   float aspect_ratio;  /**< of the calibration sensor, e.g. 1.5 */
   float min_focal, max_focal; /**< the lens's whole range: the vignetting metric needs it */
   float center_x, center_y; /**< optical centre shift, lensfun convention (fraction of size) */
+  /** Whether upstream ships <real-focal-length> data for this lens.
+   *
+   * It gates the projection stage rather than feeding it. lensfun's geometry callback uses
+   * GetRealFocalLength(focal) / get_hugin_focal_correction(focal), and MEASURED across the
+   * database that resolves to exactly the nominal focal whenever this is 0 -- the hugin
+   * factor is multiplied in and divided straight back out. When it is 1 the two do not
+   * cancel and the geometry focal is real_focal / hugin, which needs the calibration points
+   * this struct does not carry. Those lenses keep falling back rather than being corrected
+   * with the wrong focal: measured, that error is 28 px at the centre of the frame. */
+  int has_real_focal;
   int n_dist; ls_calib_dist_t dist[LS_MAX_CALIB];
   int n_tca;  ls_calib_tca_t  tca[LS_MAX_CALIB];
   int n_vig;  ls_calib_vig_t  vig[LS_MAX_CALIB];

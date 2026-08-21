@@ -48,16 +48,31 @@
   #define LS_EVAL_IS_OPENCL 1
 #endif
 
+/* Every transcendental goes through one of these, and the reason is single precision.
+ *
+ * In OpenCL C these names ARE the float overloads. In C they are the DOUBLE functions:
+ * `atan(some_float)` promotes its argument to double, evaluates in double, and truncates
+ * the result back on assignment. That is slower than the float form, and it stops the
+ * loops below from vectorising, since a `double` temporary halves the lane count. Writing
+ * the `f`-suffixed name in the host branch is what keeps this file honestly single
+ * precision on both sides.
+ *
+ * Deliberately NOT the native_* family on the OpenCL side: these results address a
+ * resampler, and native_sqrt() promises only ~12 bits. The kernel this file replaced used
+ * native_sqrt() against the library's sqrtf(), and nothing in the harness could see it. */
 #ifdef LS_EVAL_IS_OPENCL
-  /* OpenCL C: sqrt() is overloaded on float and is correctly rounded to <= 3 ulp.
-   * Deliberately NOT native_sqrt(): these coordinates address a resampler, and a
-   * 12-bit approximation -- which is all native_sqrt() promises -- moves pixels. The
-   * kernel this file replaces used native_sqrt() against the library's sqrtf(), and
-   * nothing in the harness could see the difference. */
-  #define LS_SQRT(x) sqrt(x)
+  #define LS_SQRT(x)  sqrt(x)
+  #define LS_ATAN(x)  atan(x)
+  #define LS_ASIN(x)  asin(x)
+  #define LS_SIN(x)   sin(x)
+  #define LS_TAN(x)   tan(x)
 #else
   #include <math.h>
-  #define LS_SQRT(x) sqrtf(x)
+  #define LS_SQRT(x)  sqrtf(x)
+  #define LS_ATAN(x)  atanf(x)
+  #define LS_ASIN(x)  asinf(x)
+  #define LS_SIN(x)   sinf(x)
+  #define LS_TAN(x)   tanf(x)
 #endif
 
 /* Mirrors of the model enumerations in lensserious.h. Spelled as plain integers so this
@@ -207,13 +222,13 @@ static inline float ls_eval_geom_angle(const int model, const float f, const flo
   if(f <= 0.f) return -1.f;
   switch(model)
   {
-    case LS_EVAL_LENS_RECTILINEAR:           return atan(r / f);
+    case LS_EVAL_LENS_RECTILINEAR:           return LS_ATAN(r / f);
     case LS_EVAL_LENS_FISHEYE:               return r / f;
-    case LS_EVAL_LENS_FISHEYE_ORTHOGRAPHIC:  return (r <= f) ? asin(r / f) : -1.f;
-    case LS_EVAL_LENS_FISHEYE_STEREOGRAPHIC: return 2.f * atan(r / (2.f * f));
-    case LS_EVAL_LENS_FISHEYE_EQUISOLID:     return (r <= 2.f * f) ? 2.f * asin(r / (2.f * f)) : -1.f;
+    case LS_EVAL_LENS_FISHEYE_ORTHOGRAPHIC:  return (r <= f) ? LS_ASIN(r / f) : -1.f;
+    case LS_EVAL_LENS_FISHEYE_STEREOGRAPHIC: return 2.f * LS_ATAN(r / (2.f * f));
+    case LS_EVAL_LENS_FISHEYE_EQUISOLID:     return (r <= 2.f * f) ? 2.f * LS_ASIN(r / (2.f * f)) : -1.f;
     case LS_EVAL_LENS_FISHEYE_THOBY:
-      return (r <= 1.47f * f) ? asin(r / (1.47f * f)) / 0.713f : -1.f;
+      return (r <= 1.47f * f) ? LS_ASIN(r / (1.47f * f)) / 0.713f : -1.f;
     default: return -1.f;   /* panoramic and equirectangular are not radial; see the header */
   }
 }
@@ -225,14 +240,14 @@ static inline float ls_eval_geom_radius(const int model, const float f, const fl
   switch(model)
   {
     case LS_EVAL_LENS_RECTILINEAR:
-      /* Beyond a right angle a rectilinear lens images nothing: tan() would silently wrap
+      /* Beyond a right angle a rectilinear lens images nothing: LS_TAN() would silently wrap
        * a point behind the camera round to the front. */
-      return (theta < 1.5707963f) ? f * tan(theta) : -1.f;
+      return (theta < 1.5707963f) ? f * LS_TAN(theta) : -1.f;
     case LS_EVAL_LENS_FISHEYE:               return f * theta;
-    case LS_EVAL_LENS_FISHEYE_ORTHOGRAPHIC:  return f * sin(theta);
-    case LS_EVAL_LENS_FISHEYE_STEREOGRAPHIC: return 2.f * f * tan(theta * 0.5f);
-    case LS_EVAL_LENS_FISHEYE_EQUISOLID:     return 2.f * f * sin(theta * 0.5f);
-    case LS_EVAL_LENS_FISHEYE_THOBY:         return 1.47f * f * sin(0.713f * theta);
+    case LS_EVAL_LENS_FISHEYE_ORTHOGRAPHIC:  return f * LS_SIN(theta);
+    case LS_EVAL_LENS_FISHEYE_STEREOGRAPHIC: return 2.f * f * LS_TAN(theta * 0.5f);
+    case LS_EVAL_LENS_FISHEYE_EQUISOLID:     return 2.f * f * LS_SIN(theta * 0.5f);
+    case LS_EVAL_LENS_FISHEYE_THOBY:         return 1.47f * f * LS_SIN(0.713f * theta);
     default: return -1.f;
   }
 }
@@ -323,7 +338,19 @@ static inline float ls_eval_vignette_factor(const ls_eval_t *p, float xu, float 
   const float r4 = r2 * r2;
   const float c = 1.f + p->vig_terms[0] * r2 + p->vig_terms[1] * r4
                       + p->vig_terms[2] * r4 * r2;
-  return (c != 0.f) ? 1.f / c : 1.f;
+  if(c == 0.f) return 1.f;
+
+  /* Clamped at zero, because the pa polynomial is not constrained to stay positive and for
+   * some lenses it crosses zero INSIDE the frame -- the Canon EF 8-15mm Fisheye at 8mm has
+   * k = (-0.625, 5.648, -19.330), whose root sits near r = 0.65. Past that root 1/c is
+   * negative, which is not a brightness.
+   *
+   * Upstream clamps the same thing one step later: apply_multiplier() writes
+   * clampd(pixel * c, 0, type_max) (mod-color.cpp), so for the non-negative pixels this
+   * ever sees, clamping the factor here is equivalent. Without it this returned -0.203
+   * where lensfun returns 0, on every fisheye whose model has a root in frame. */
+  const float m = 1.f / c;
+  return (m > 0.f) ? m : 0.f;
 }
 
 #endif /* LENSSERIOUS_EVAL_H */
