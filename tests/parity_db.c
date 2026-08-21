@@ -401,6 +401,97 @@ int main(int argc, char **argv)
   printf("db parity: %d threads x %d rounds x %d lookups, own handle each, %s\n",
          spawned, 4, sample, (cerr || cmis) ? "MISMATCHED" : "all identical");
 
+  /* The browse-side API: what a picker lists, rather than what the pipeline evaluates.
+   * Compared against liblensfun the same way as everything else -- these feed a menu the
+   * user chooses a camera from, and a wrong crop factor there is a wrong correction. */
+  {
+    const int n_cam = ls_db_list_cameras(db, NULL, 0);
+    const lfCamera *const *lfcams = lf_db_get_cameras(ldb);
+    int n_lf = 0;
+    for(int i = 0; lfcams && lfcams[i]; i++) n_lf++;
+    if(n_cam != n_lf)
+      FAILF("camera count %d (db) != %d (lensfun)\n", n_cam, n_lf);
+    else
+    {
+      long long *cam_ids = (long long *)malloc((size_t)n_cam * sizeof(*cam_ids));
+      ls_db_list_cameras(db, cam_ids, n_cam);
+      int checked = 0;
+      for(int i = 0; i < n_cam; i++)
+      {
+        char maker[256], model[256], variant[256];
+        ls_camera_t cam;
+        if(ls_db_camera_name(db, cam_ids[i], maker, sizeof(maker), model, sizeof(model),
+                             variant, sizeof(variant)) != 1
+           || ls_db_camera_by_id(db, cam_ids[i], &cam) != 1)
+        {
+          FAILF("camera id %lld does not resolve\n", cam_ids[i]);
+          continue;
+        }
+        /* Insertion order is the importer's iteration order over lensfun's own list, so
+         * index i is the same camera on both sides. Asserted by comparing the names, not
+         * assumed. */
+        const lfCamera *c = lfcams[i];
+        const char *lmaker = lf_mlstr_get(c->Maker), *lmodel = lf_mlstr_get(c->Model);
+        if((lmaker && strcmp(maker, lmaker)) || (lmodel && strcmp(model, lmodel)))
+          FAILF("camera %d: \"%s\"/\"%s\" (db) != \"%s\"/\"%s\" (lensfun)\n", i, maker,
+                model, lmaker ? lmaker : "", lmodel ? lmodel : "");
+        else if(cam.crop_factor != c->CropFactor)
+          FAILF("camera %s %s: crop %g (db) != %g (lensfun)\n", maker, model,
+                (double)cam.crop_factor, (double)c->CropFactor);
+        else
+          checked++;
+      }
+      printf("db parity: %d cameras compared field by field against liblensfun\n", checked);
+      free(cam_ids);
+    }
+  }
+
+  /* Lens ranges and mount lists, the other half of what a picker shows. */
+  {
+    int checked = 0, mount_mismatch = 0, upstream_dup_mounts = 0;
+    for(int i = 0; i < n; i++)
+    {
+      float mnf = 0.f, mxf = 0.f, mna = 0.f, mxa = 0.f;
+      if(ls_db_lens_range(db, ids[i], &mnf, &mxf, &mna, &mxa) != 1) continue;
+      const lfLens *l = lenses[i];
+      if(!l) continue;
+      if(mnf != l->MinFocal || mxf != l->MaxFocal)
+        FAILF("%s: focal range %g-%g (db) != %g-%g (lensfun)\n", l->Model, (double)mnf,
+              (double)mxf, (double)l->MinFocal, (double)l->MaxFocal);
+      else checked++;
+
+      /* Mount COUNT only: the joined string is ordered by name here and by upstream's file
+       * order there, and which spelling a picker shows is not a correctness question.
+       *
+       * Upstream's list is DEDUPLICATED before counting, because it is not always distinct:
+       * the TTArtisan 50mm f/2 lists "Canon RF" twice. lens_mount is keyed (lens_id,
+       * mount_id) so the importer collapses that, which is the right answer -- a mount a
+       * lens fits twice is a mount a lens fits. The duplicates are counted and reported
+       * rather than silently absorbed. */
+      char mounts[512];
+      const int n_m = ls_db_lens_mounts(db, ids[i], mounts, sizeof(mounts));
+      int n_lf_m = 0;
+      if(l->Mounts)
+        for(int k = 0; l->Mounts[k]; k++)
+        {
+          int dup = 0;
+          for(int j = 0; j < k; j++) if(!strcmp(l->Mounts[j], l->Mounts[k])) { dup = 1; break; }
+          if(dup) { upstream_dup_mounts++; continue; }
+          n_lf_m++;
+        }
+      if(n_m != n_lf_m)
+      {
+        mount_mismatch++;
+        if(mount_mismatch < 4)
+          FAILF("%s: %d mounts [%s] against liblensfun's %d distinct\n", l->Model, n_m,
+                mounts, n_lf_m);
+      }
+    }
+    printf("db parity: %d lens ranges and %d mount lists compared (%d duplicate mount"
+           " entries in upstream, collapsed by the schema's primary key)\n", checked, n,
+           upstream_dup_mounts);
+  }
+
   free(ids);
   free(crops);
   free(reference);

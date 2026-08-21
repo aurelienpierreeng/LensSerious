@@ -225,6 +225,58 @@ int ls_db_list_lenses(ls_db_t *db, long long *out_ids, int max);
 int ls_db_lens_name(ls_db_t *db, long long lens_id, char *maker, size_t maker_size,
                     char *model, size_t model_size);
 
+/**
+ * @brief The lens's focal and aperture range, for a picker that lists it.
+ *
+ * @param db an open database.
+ * @param lens_id the lens.
+ * @param min_focal, max_focal, min_aperture, max_aperture filled in; any may be NULL.
+ * @return 1 when the lens exists, 0 when it does not, -1 on error.
+ */
+int ls_db_lens_range(ls_db_t *db, long long lens_id, float *min_focal, float *max_focal,
+                     float *min_aperture, float *max_aperture);
+
+/**
+ * @brief The mounts a lens is made for, joined with ", ".
+ *
+ * @param db an open database.
+ * @param lens_id the lens.
+ * @param out caller's buffer; always NUL-terminated when @p out_size is non-zero.
+ * @param out_size its size.
+ * @return the number of mounts written, or -1 on error.
+ *
+ * @note These are the lens's OWN mounts, not the mounts it is compatible with. Asking
+ * whether a particular camera can take it is ls_db_lens_fits_mount(), which does consult
+ * upstream's compatibility table; this is the descriptive string a picker shows.
+ */
+int ls_db_lens_mounts(ls_db_t *db, long long lens_id, char *out, size_t out_size);
+
+/**
+ * @brief Enumerate camera ids, for a GUI's camera picker.
+ *
+ * @param db an open database.
+ * @param out_ids caller's array, or NULL to count only.
+ * @param max the length of @p out_ids.
+ * @return how many ids were written (or how many exist, if @p out_ids is NULL), or -1.
+ */
+int ls_db_list_cameras(ls_db_t *db, long long *out_ids, int max);
+
+/**
+ * @brief A camera's maker, model and variant, as stored.
+ *
+ * @param db an open database.
+ * @param camera_id the camera.
+ * @param maker, model, variant caller's buffers; any may be NULL. @p variant is set to the
+ * empty string for the cameras that have none, which is most of them.
+ * @param maker_size, model_size, variant_size their sizes.
+ * @return 1 when the camera exists, 0 when it does not, -1 on error.
+ */
+int ls_db_camera_name(ls_db_t *db, long long camera_id, char *maker, size_t maker_size,
+                      char *model, size_t model_size, char *variant, size_t variant_size);
+
+/** @brief Load a camera by its database id, for a caller that already resolved one. */
+int ls_db_camera_by_id(ls_db_t *db, long long camera_id, ls_camera_t *out);
+
 #ifdef __cplusplus
 }
 #endif

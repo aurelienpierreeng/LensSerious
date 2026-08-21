@@ -492,6 +492,150 @@ int ls_db_lens_name(ls_db_t *db, long long lens_id, char *maker, size_t maker_si
   return written;
 }
 
+int ls_db_lens_range(ls_db_t *db, long long lens_id, float *min_focal, float *max_focal,
+                     float *min_aperture, float *max_aperture)
+{
+  if(!db || !db->sql) return -1;
+  if(min_focal) *min_focal = 0.f;
+  if(max_focal) *max_focal = 0.f;
+  if(min_aperture) *min_aperture = 0.f;
+  if(max_aperture) *max_aperture = 0.f;
+
+  sqlite3_stmt *st = NULL;
+  if(sqlite3_prepare_v2(db->sql,
+                        "SELECT min_focal, max_focal, min_aperture, max_aperture"
+                        " FROM lens WHERE id = ?1", -1, &st, NULL) != SQLITE_OK)
+  {
+    _db_err(db, "prepare lens range");
+    return -1;
+  }
+  sqlite3_bind_int64(st, 1, lens_id);
+  int found = 0;
+  if(sqlite3_step(st) == SQLITE_ROW)
+  {
+    found = 1;
+    if(min_focal) *min_focal = (float)sqlite3_column_double(st, 0);
+    if(max_focal) *max_focal = (float)sqlite3_column_double(st, 1);
+    if(min_aperture) *min_aperture = (float)sqlite3_column_double(st, 2);
+    if(max_aperture) *max_aperture = (float)sqlite3_column_double(st, 3);
+  }
+  sqlite3_finalize(st);
+  return found;
+}
+
+int ls_db_lens_mounts(ls_db_t *db, long long lens_id, char *out, size_t out_size)
+{
+  if(!db || !db->sql) return -1;
+  if(out && out_size) out[0] = '\0';
+
+  sqlite3_stmt *st = NULL;
+  if(sqlite3_prepare_v2(db->sql,
+                        "SELECT m.name FROM lens_mount lm JOIN mount m ON m.id = lm.mount_id"
+                        " WHERE lm.lens_id = ?1 ORDER BY m.name", -1, &st, NULL) != SQLITE_OK)
+  {
+    _db_err(db, "prepare lens mounts");
+    return -1;
+  }
+  sqlite3_bind_int64(st, 1, lens_id);
+
+  int n = 0;
+  size_t used = 0;
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    const char *name = (const char *)sqlite3_column_text(st, 0);
+    if(!name) continue;
+    n++;
+    if(!out || out_size == 0) continue;
+    /* Truncate rather than fail: this string is shown to a person, and a picker that says
+     * nothing because one lens has more mounts than the caller budgeted for is worse than
+     * one that says most of them. The count returned is still the true count. */
+    const size_t need = strlen(name) + (used ? 2 : 0);
+    if(used + need >= out_size) continue;
+    if(used) { memcpy(out + used, ", ", 2); used += 2; }
+    memcpy(out + used, name, strlen(name));
+    used += strlen(name);
+    out[used] = '\0';
+  }
+  sqlite3_finalize(st);
+  return n;
+}
+
+int ls_db_list_cameras(ls_db_t *db, long long *out_ids, int max)
+{
+  if(!db || !db->sql) return -1;
+
+  sqlite3_stmt *st = NULL;
+  if(sqlite3_prepare_v2(db->sql, "SELECT id FROM camera ORDER BY id", -1, &st, NULL)
+     != SQLITE_OK)
+  {
+    _db_err(db, "prepare camera list");
+    return -1;
+  }
+  int n = 0;
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    if(out_ids && n < max) out_ids[n] = sqlite3_column_int64(st, 0);
+    n++;
+  }
+  sqlite3_finalize(st);
+  return (out_ids && n > max) ? max : n;
+}
+
+int ls_db_camera_name(ls_db_t *db, long long camera_id, char *maker, size_t maker_size,
+                      char *model, size_t model_size, char *variant, size_t variant_size)
+{
+  if(!db || !db->sql) return -1;
+  if(maker && maker_size) maker[0] = '\0';
+  if(model && model_size) model[0] = '\0';
+  if(variant && variant_size) variant[0] = '\0';
+
+  sqlite3_stmt *st = NULL;
+  if(sqlite3_prepare_v2(db->sql, "SELECT maker, model, variant FROM camera WHERE id = ?1",
+                        -1, &st, NULL) != SQLITE_OK)
+  {
+    _db_err(db, "prepare camera name");
+    return -1;
+  }
+  sqlite3_bind_int64(st, 1, camera_id);
+  int found = 0;
+  if(sqlite3_step(st) == SQLITE_ROW)
+  {
+    found = 1;
+    const char *a = (const char *)sqlite3_column_text(st, 0);
+    const char *b = (const char *)sqlite3_column_text(st, 1);
+    const char *c = (const char *)sqlite3_column_text(st, 2);
+    if(maker && maker_size && a) snprintf(maker, maker_size, "%s", a);
+    if(model && model_size && b) snprintf(model, model_size, "%s", b);
+    if(variant && variant_size && c) snprintf(variant, variant_size, "%s", c);
+  }
+  sqlite3_finalize(st);
+  return found;
+}
+
+int ls_db_camera_by_id(ls_db_t *db, long long camera_id, ls_camera_t *out)
+{
+  if(!db || !db->sql || !out) return -1;
+  memset(out, 0, sizeof(*out));
+
+  sqlite3_stmt *st = NULL;
+  if(sqlite3_prepare_v2(db->sql, "SELECT crop_factor, mount_id FROM camera WHERE id = ?1",
+                        -1, &st, NULL) != SQLITE_OK)
+  {
+    _db_err(db, "prepare camera by id");
+    return -1;
+  }
+  sqlite3_bind_int64(st, 1, camera_id);
+  int found = 0;
+  if(sqlite3_step(st) == SQLITE_ROW)
+  {
+    found = 1;
+    out->crop_factor = (float)sqlite3_column_double(st, 0);
+    out->mount_id = sqlite3_column_int64(st, 1);
+  }
+  sqlite3_finalize(st);
+  return found;
+}
+
 int ls_db_meta(ls_db_t *db, const char *key, char *out, size_t out_size)
 {
   if(!db || !db->sql || !key || !out || out_size == 0) return -1;
