@@ -134,7 +134,7 @@ Head-to-head against liblensfun 0.3.4, 24 Mpx, single-threaded, both sides on th
 | | lensfun | LensSerious | |
 |---|---|---|---|
 | open the database | 99.2 ms | **0.261 ms** | 380× faster |
-| find the lens (fuzzy) | 0.038 ms | 0.28 ms | 7× slower |
+| find the lens (fuzzy) | 0.031 ms | 0.21 ms | 7× slower |
 | resolve at focal/aperture | 0.5 µs | 0.04 µs | 13× faster |
 | build the whole geometry map | 288.5 ms | 293.4 ms | **1.0× — no faster** |
 | apply vignetting, whole frame | 71.4 ms | **49.3 ms** | 1.4× faster |
@@ -174,8 +174,18 @@ Three things were tried, measured, and are deliberately *not* in the code:
   the candidates it removes. Requiring the maker would cost accuracy too: it is scored rather
   than required precisely because vendors and upstream disagree about vendors' own names.
 
+Then the indexes were looked at properly. Both matcher queries reported `SEARCH … USING
+INDEX`, which reads like the work is done — but the row an index lands on is an index entry,
+and every column outside it is another b-tree descent into the table. Making them **covering**
+(`lens_name(lens_id, kind, norm)`, `lens_token(kind, token, lens_id)`) removed those descents:
+0.180 → 0.150 ms. And the `calib_*` tables, which are only ever read one lens at a time, are
+now `WITHOUT ROWID` keyed on `(lens_id, ord)`, so a lens's calibration is contiguous and the
+read never leaves the b-tree — 0.0436 → 0.0385 ms, and *smaller*, since three `lens_id`
+indexes go away. `ord` also turns the reader's row-order assumption into a primary key rather
+than a habit.
+
 What remains is spread thin — scoring 21%, SQLite 28% over two queries, tokenising 8% — at
-~2 ns per token comparison, with no single error left. 5.6× lensfun, from 96×.
+~2 ns per token comparison, with no single error left. **6.7× lensfun, from 96×.**
 
 **Vignetting** was 1.8× *slower* until the divides were counted. Three causes, worth
 recording because two of them are not about arithmetic: the half-diagonal coordinate system
