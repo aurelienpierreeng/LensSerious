@@ -173,11 +173,14 @@ did *not* work are in [the maintainer's log](doc/maintainers.md#log-matcher).)
 Two structural consequences follow from that row, and they are the actual reason for the
 rewrite:
 
-- lensfun's cost is per *process*, so it is paid again by every worker, and it scales with
-  the size of the upstream database rather than with the number of lenses used. LensSerious'
-  is per *query*.
-- Because the file is immutable and lock-free, that 0.35 ms is also what it costs from
-  **any** thread concurrently, with no mutex and no shared handle.
+- lensfun's cost is either:
+  - per *process*, so it is 102 ms paid again by every worker,
+  - per *application*, so it is 102 ms paid once at startup, and then 31 µs at each query,
+    but each worker needs to lock an app-wide mutex to protect global states, and possibly
+    wait for other threads to release the lock.
+- Because the LensSerious database is immutable, stateless and lock-free, that 0.35 ms is what it costs from
+  **any** thread concurrently at each query, with no mutex, no shared handle, so it's not only much
+  faster: parallel accesses 
 
 ### Processing the pixels
 
