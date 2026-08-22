@@ -38,5 +38,5 @@ int main(int argc, char **argv)
     return 2;
   }
 
-  return ls_import_run(argv[1], argv[2], (argc > 3) ? argv[3] : NULL);
+  return ls_import_run(argv[1], argv[2], NULL, (argc > 3) ? argv[3] : NULL);
 }

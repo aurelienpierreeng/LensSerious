@@ -38,6 +38,15 @@ extern "C" {
  * @param out_path where to write. The file is written to a temporary and RENAMED into
  * place, so a reader opening it with `immutable=1` never sees a partial database and a
  * killed run cannot leave one that looks complete. See lensserious_db.h.
+ * @param base_xml_dir a directory of lensfun XML to load FIRST, or NULL. Everything loaded
+ * afterwards can override a lens defined here, and a lens nobody else defines survives --
+ * lensfun's own "later definitions override earlier" rule, applied by lensfun.
+ *
+ * This is what makes an update additive rather than a replacement. A consumer that ships a
+ * database passes its own calibrations here and the machine's profiles are merged over the
+ * top; without it, a machine with no system-wide lensfun yields a database holding only the
+ * few profiles its user wrote by hand, which is a catastrophic thing to install in place of
+ * fifteen hundred lenses.
  * @param xml_dir a directory of lensfun XML to read, or NULL.
  *
  * NULL is the interesting value, and is what a consumer's updater wants: it calls
@@ -54,7 +63,8 @@ extern "C" {
  * process on a database error, which is the right contract for the two command-line tools
  * that call it and the wrong one for anything else.
  */
-int ls_import_run(const char *schema_path, const char *out_path, const char *xml_dir);
+int ls_import_run(const char *schema_path, const char *out_path,
+                  const char *base_xml_dir, const char *xml_dir);
 
 #ifdef __cplusplus
 }

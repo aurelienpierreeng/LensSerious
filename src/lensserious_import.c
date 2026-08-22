@@ -288,7 +288,8 @@ static int _load_directory(lfDatabase *ldb, const char *dirname)
 #endif
 }
 
-int ls_import_run(const char *schema_path, const char *out_path, const char *xml_dir)
+int ls_import_run(const char *schema_path, const char *out_path,
+                  const char *base_xml_dir, const char *xml_dir)
 {
 
   char *schema = read_file(schema_path);
@@ -304,17 +305,40 @@ int ls_import_run(const char *schema_path, const char *out_path, const char *xml
   lfDatabase *ldb = lf_db_new();
   if(!ldb) die("lf_db_new", NULL);
 
+  /* The baseline, if the caller has one, goes in FIRST -- lensfun's rule is that a later
+   * definition overrides an earlier one, so everything loaded below can replace a lens
+   * here while a lens nobody else defines survives.
+   *
+   * That is what makes an update additive. A consumer shipping a database can hand its own
+   * calibrations in here, and whatever this machine has is then merged over the top by
+   * lensfun's own precedence rather than by SQL this project would have to write. Without
+   * it, a machine with no system-wide lensfun would produce a database holding nothing but
+   * the handful of profiles the user wrote themselves -- correct as far as it goes, and a
+   * catastrophic replacement for a database of fifteen hundred lenses. */
+  int loaded_any = 0;
+  if(base_xml_dir)
+  {
+    if(_load_directory(ldb, base_xml_dir))
+      loaded_any = 1;
+    else
+      fprintf(stderr, "import: warning: no baseline loaded from `%s'\n", base_xml_dir);
+  }
+
   if(xml_dir)
   {
-    if(!_load_directory(ldb, xml_dir))
+    if(_load_directory(ldb, xml_dir)) loaded_any = 1;
+    else if(!loaded_any)
     {
       fprintf(stderr, "import: no database loaded from `%s'\n", xml_dir);
       return 1;
     }
   }
-  else if(lf_db_load(ldb) != LF_NO_ERROR)
+  else if(lf_db_load(ldb) == LF_NO_ERROR)
+    loaded_any = 1;
+
+  if(!loaded_any)
   {
-    fprintf(stderr, "import: no system lensfun database found\n");
+    fprintf(stderr, "import: no lensfun database found\n");
     return 1;
   }
 
