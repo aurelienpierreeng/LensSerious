@@ -421,11 +421,13 @@ _Static_assert((int)LS_DIST_NONE   == LS_EVAL_DIST_NONE,   "distortion model mir
 _Static_assert((int)LS_DIST_POLY3  == LS_EVAL_DIST_POLY3,  "distortion model mirror drifted");
 _Static_assert((int)LS_DIST_POLY5  == LS_EVAL_DIST_POLY5,  "distortion model mirror drifted");
 _Static_assert((int)LS_DIST_PTLENS == LS_EVAL_DIST_PTLENS, "distortion model mirror drifted");
+_Static_assert((int)LS_DIST_KNOTS  == LS_EVAL_DIST_KNOTS,  "distortion model mirror drifted");
 _Static_assert((int)LS_TCA_NONE    == LS_EVAL_TCA_NONE,    "TCA model mirror drifted");
 _Static_assert((int)LS_TCA_LINEAR  == LS_EVAL_TCA_LINEAR,  "TCA model mirror drifted");
 _Static_assert((int)LS_TCA_POLY3   == LS_EVAL_TCA_POLY3,   "TCA model mirror drifted");
 _Static_assert((int)LS_VIG_NONE    == LS_EVAL_VIG_NONE,    "vignetting model mirror drifted");
 _Static_assert((int)LS_VIG_PA      == LS_EVAL_VIG_PA,      "vignetting model mirror drifted");
+_Static_assert((int)LS_VIG_KNOTS   == LS_EVAL_VIG_KNOTS,   "vignetting model mirror drifted");
 
 _Static_assert(LS_ENABLE_DISTORTION == LS_EVAL_ENABLE_DISTORTION, "enable bit mirror drifted");
 _Static_assert(LS_ENABLE_TCA        == LS_EVAL_ENABLE_TCA,        "enable bit mirror drifted");
@@ -442,9 +444,21 @@ _Static_assert((int)LS_LENS_FISHEYE_THOBY == LS_EVAL_LENS_FISHEYE_THOBY, "lens t
 _Static_assert(sizeof(ls_eval_t) == 8 * sizeof(float)      /* the coordinate system */
                                   + 4 * sizeof(int)        /* model ids and enable bits */
                                   + 2 * sizeof(int)        /* geom_from, geom_to */
-                                  + 2 * sizeof(float)      /* geom_focal, _pad */
-                                  + 12 * sizeof(float),    /* the terms */
+                                  + 2 * sizeof(float)      /* geom_focal, reverse */
+                                  + 12 * sizeof(float)     /* the terms */
+                                  + 2 * sizeof(int)        /* knot_n, knot_vn */
+                                  + (6 * LS_MAX_KNOTS      /* knot_r, knot_c */
+                                     + 2 * LS_MAX_KNOTS)   /* knot_vr, knot_v */
+                                        * sizeof(float),
                "ls_eval_t gained padding or a member: check it is still scalar-only");
+
+/* The whole point of the by-value transport is that it fits in a kernel argument list, and
+ * the smallest CL_DEVICE_MAX_PARAMETER_SIZE OpenCL 1.2 guarantees is 1024 bytes -- for ALL
+ * of a kernel's arguments together, not for this one. The consumer's widest kernel spends
+ * about 80 bytes on everything else (two images, six ints, two flags), so this leaves that
+ * headroom and still fails the build rather than the device if the tables ever grow. */
+_Static_assert(sizeof(ls_eval_t) <= 1024 - 128,
+               "ls_eval_t no longer fits a guaranteed OpenCL kernel argument list");
 _Static_assert(_Alignof(ls_eval_t) == _Alignof(float), "ls_eval_t alignment is no longer 4");
 
 /* How far outside the frame a point landed, as a signed distance: negative inside,
@@ -483,7 +497,7 @@ static float _autoscale_distance(const ls_eval_t *p, const float ca, const float
   for(int countdown = 50; ; countdown--)
   {
     float x = ca * ru, y = sa * ru;
-    if(!ls_eval_coord_chain(p, &x, &y)) { x = LS_GEOM_SENTINEL * ca * ru;
+    if(!ls_eval_coord_chain(p, 1, &x, &y)) { x = LS_GEOM_SENTINEL * ca * ru;
                                           y = LS_GEOM_SENTINEL * sa * ru; }
     const float rd = _autoscale_residual(p, max_x, max_y, x, y);
     /* Upstream's NEWTON_EPS * 100. */
@@ -491,7 +505,7 @@ static float _autoscale_distance(const ls_eval_t *p, const float ca, const float
     if(!countdown) return -1.f;   /* e.g. an ultrawide fisheye corner extending to infinity */
 
     float x1 = ca * (ru + dx), y1 = sa * (ru + dx);
-    if(!ls_eval_coord_chain(p, &x1, &y1)) { x1 = LS_GEOM_SENTINEL * ca * (ru + dx);
+    if(!ls_eval_coord_chain(p, 1, &x1, &y1)) { x1 = LS_GEOM_SENTINEL * ca * (ru + dx);
                                             y1 = LS_GEOM_SENTINEL * sa * (ru + dx); }
     const float rd1 = _autoscale_residual(p, max_x, max_y, x1, y1);
 
@@ -501,6 +515,143 @@ static float _autoscale_distance(const ls_eval_t *p, const float ca, const float
 
     ru -= rd / ((rd1 - rd) / dx);
   }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Embedded maker profiles — the second source of correction data.            */
+/* ------------------------------------------------------------------------- */
+
+/* A table is only usable if its radii ascend: the lookup walks them in order and stops at
+ * the first one it does not exceed, so an out-of-order axis reads the wrong segment rather
+ * than failing. Ties are refused too -- ls_eval_knot_lookup() returns the left value on a
+ * zero-width segment, which is defined but is not an interpolation.
+ *
+ * Worth checking rather than assuming, because the reverse direction CONSTRUCTS an axis
+ * (r*cor(r)) instead of receiving one, and that product is only monotone while the profile
+ * is physically sensible. A correction so strong it folds the image back on itself has no
+ * inverse to build, and the honest answer is to decline the axis. */
+static int _knot_axis_ascends(const float *xs, const int n)
+{
+  for(int i = 1; i < n; i++)
+    if(!(xs[i] > xs[i - 1])) return 0;
+  return 1;
+}
+
+int ls_modifier_init_knots(ls_modifier_t *mod, const ls_knots_t *knots,
+                           int width, int height, float scale, int flags, int reverse)
+{
+  if(!mod) return 0;
+  memset(mod, 0, sizeof(*mod));
+  if(!knots || width < 1 || height < 1) return 0;
+
+  /* The makers' coordinate system, adopted rather than converted: the distance from the
+   * image centre over half the image diagonal, so 1.0 lands on the far corner. Note the
+   * centre is at width/2, NOT at (width-1)/2 -- lensfun's pixel-rim convention is its own,
+   * and applying it to numbers measured under a different one would move every pixel by
+   * half of one.
+   *
+   * aspect_ratio_correction stays 1: it exists to reconcile lensfun's two normalizations
+   * (distortion against the short side, vignetting against the diagonal), and the makers
+   * index both of theirs the same way. */
+  const float w2 = (float)width * 0.5f;
+  const float h2 = (float)height * 0.5f;
+  const float rn = sqrtf(w2 * w2 + h2 * h2);
+  if(!(rn > 0.f)) return 0;
+
+  mod->width = (float)width;
+  mod->height = (float)height;
+  mod->norm_scale = 1.f / rn;
+  mod->norm_unscale = rn;
+  mod->aspect_ratio_correction = 1.f;
+  mod->center_x = w2 / rn;
+  mod->center_y = h2 / rn;
+
+  /* No projection change: the profile describes the lens as it shipped, in the projection
+   * it shipped with. Leaving both endpoints UNKNOWN keeps ls_eval_coord_chain()'s geometry
+   * stage switched off rather than running an identity through the fisheye transcendentals. */
+  mod->geom_from = LS_LENS_UNKNOWN;
+  mod->geom_to = LS_LENS_UNKNOWN;
+  mod->geom_focal = 0.f;
+  mod->reverse = reverse ? 1 : 0;
+
+  int enabled = 0;
+
+  if(scale != 1.f && scale > 0.f)
+  {
+    /* Same two halves as ls_modifier_init(): the stored factor is reciprocated for the
+     * correcting pass, and the stage moves from first to last in the reverse one. */
+    mod->scale = mod->reverse ? scale : 1.f / scale;
+    enabled |= LS_ENABLE_SCALE;
+  }
+  else
+    mod->scale = 1.f;
+
+  const int n = (knots->n > LS_MAX_KNOTS) ? LS_MAX_KNOTS : knots->n;
+  if((flags & LS_ENABLE_DISTORTION) && n > 0 && _knot_axis_ascends(knots->radius, n))
+  {
+    int usable = 1;
+    for(int c = 0; c < 3 && usable; c++)
+    {
+      for(int i = 0; i < n; i++)
+      {
+        const float r = knots->radius[i];
+        const float f = knots->cor_rgb[c][i];
+        if(!(f > 0.f)) { usable = 0; break; }
+
+        if(mod->reverse)
+        {
+          /* Reading the same curve the other way round. The forward map sends radius r to
+           * r*cor(r), so the point (r*cor(r), 1/cor(r)) is on the inverse -- the radius the
+           * point arrives at, and the factor that takes it back. No solver: this is the one
+           * thing a table gives that a polynomial does not.
+           *
+           * Exact AT the knots, and second-order between them, because a segment that is
+           * straight going forwards is not straight coming back. That is the same class of
+           * error the input already carries -- the maker's own samples are themselves a
+           * straight-line reading of a smooth curve. Measured rather than argued: 0.13 px
+           * worst case on a 6000x4000 frame, tests/knots.c. */
+          mod->knot_r[c][i] = r * f;
+          mod->knot_c[c][i] = 1.f / f;
+        }
+        else
+        {
+          mod->knot_r[c][i] = r;
+          mod->knot_c[c][i] = f;
+        }
+      }
+      /* Forwards this re-checks the axis already checked above, which is the point: the
+       * reverse axis is CONSTRUCTED, one per channel, and only monotone while the profile
+       * is physically sensible. A correction strong enough to fold the image back on itself
+       * has no inverse to build. */
+      if(usable && !_knot_axis_ascends(mod->knot_r[c], n)) usable = 0;
+    }
+
+    if(usable)
+    {
+      mod->dist.model = LS_DIST_KNOTS;
+      mod->knot_n = n;
+      enabled |= LS_ENABLE_DISTORTION;
+    }
+  }
+
+  const int vn = (knots->vn > LS_MAX_KNOTS) ? LS_MAX_KNOTS : knots->vn;
+  if((flags & LS_ENABLE_VIGNETTING) && vn > 0 && _knot_axis_ascends(knots->vig_radius, vn))
+  {
+    mod->vig.model = LS_VIG_KNOTS;
+    mod->knot_vn = vn;
+    for(int i = 0; i < vn; i++)
+    {
+      mod->knot_vr[i] = knots->vig_radius[i];
+      mod->knot_v[i] = knots->vig[i];
+    }
+    enabled |= LS_ENABLE_VIGNETTING;
+  }
+
+  /* No LS_ENABLE_TCA, ever, and not an oversight: the chromatic part of a maker's profile
+   * is inside the distortion table, one curve per channel. Reporting it as a separate axis
+   * would invite a caller to run a TCA stage that has no coefficients to run on. */
+  mod->enabled = enabled;
+  return enabled;
 }
 
 float ls_modifier_autoscale(const ls_modifier_t *mod)
@@ -582,6 +733,24 @@ int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
   for(int i = 0; i < 3; i++) out->dist_terms[i] = mod->dist.terms[i];
   for(int i = 0; i < 6; i++) out->tca_terms[i] = mod->tca.terms[i];
   for(int i = 0; i < 3; i++) out->vig_terms[i] = mod->vig.terms[i];
+
+  /* A maker's table, if this is one. Already per channel and already facing the requested
+   * direction -- ls_modifier_init_knots() did both -- so this is a copy and nothing else.
+   * Whichever kind of modifier this is, the other kind's fields stay at the memset zero,
+   * and dist_model/vig_model are what the evaluator reads to tell them apart. */
+  out->knot_n = mod->knot_n;
+  for(int c = 0; c < 3; c++)
+    for(int i = 0; i < mod->knot_n; i++)
+    {
+      out->knot_r[c][i] = mod->knot_r[c][i];
+      out->knot_c[c][i] = mod->knot_c[c][i];
+    }
+  out->knot_vn = mod->knot_vn;
+  for(int i = 0; i < mod->knot_vn; i++)
+  {
+    out->knot_vr[i] = mod->knot_vr[i];
+    out->knot_v[i] = mod->knot_v[i];
+  }
 
   out->reverse = mod->reverse;
   if(mod->reverse)

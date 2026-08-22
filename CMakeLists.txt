@@ -78,6 +78,16 @@ if(LENSSERIOUS_TESTS)
     message(STATUS "clang not found: the OpenCL kernel will not be syntax-checked here")
   endif()
 
+  # The maker-profile path is the one part of this library liblensfun cannot arbitrate --
+  # it has no knot model to compare against -- so this test asserts properties instead, and
+  # is deliberately outside the LENSFUN_FOUND block: it must run everywhere, including on
+  # the platforms where liblensfun is not installed at all.
+  add_executable(knots tests/knots.c)
+  target_link_libraries(knots PRIVATE lensserious)
+  target_compile_options(knots PRIVATE -Wall -Wextra)
+  set_target_properties(knots PROPERTIES C_STANDARD 11)
+  add_test(NAME knots COMMAND knots)
+
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
     pkg_check_modules(LENSFUN IMPORTED_TARGET lensfun)

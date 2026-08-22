@@ -80,6 +80,22 @@
 /* Mirrors of the model enumerations in lensserious.h. Spelled as plain integers so this
  * file stays free of any host-only declaration; ls_eval_from_modifier() is what converts,
  * and tests/parity_lensfun.c asserts the two agree. */
+/* A radial correction given as a TABLE rather than a polynomial: vendors embed their own
+ * profiles in the raw's metadata that way, as a handful of knots the manufacturer measured.
+ * Everything else about the model is unchanged -- it is still "scale the centred coordinate
+ * by a factor of its radius", which is what every model here does -- so this rides through
+ * the same evaluator, the same kernels and the same by-value transport. */
+#define LS_EVAL_DIST_KNOTS  4
+#define LS_EVAL_VIG_KNOTS   2
+
+/* Sixteen matches what the vendor formats actually carry: Fuji ships nine distortion knots,
+ * Sony and Olympus fewer. It brings ls_eval_t to 632 bytes, which the by-value kernel
+ * argument still absorbs -- the smallest CL_DEVICE_MAX_PARAMETER_SIZE that OpenCL 1.2
+ * guarantees is 1024, for a kernel's whole argument list, and the measured floor on this
+ * project's devices is the same. src/lensserious.c asserts both the size and that headroom,
+ * so raising this fails the build rather than the device. */
+#define LS_MAX_KNOTS 16
+
 #define LS_EVAL_DIST_NONE   0
 #define LS_EVAL_DIST_POLY3  1
 #define LS_EVAL_DIST_POLY5  2
@@ -156,7 +172,76 @@ typedef struct ls_eval_t
   float dist_terms[3];
   float tca_terms[6];
   float vig_terms[3];
+
+  /* Knot tables, used when dist_model / vig_model say so. Per CHANNEL for the geometry,
+   * because that is what a vendor profile is: one radial curve per channel, which is
+   * distortion and TCA expressed together rather than as two stages.
+   *
+   * The radii are per-channel too. Going forwards that is redundant -- a vendor gives ONE
+   * set of knots shared by all three curves -- and it is what makes the REVERSE direction
+   * exact rather than merely close. Inverting r_src = r * cor(r) has no closed form in
+   * general, but a piecewise-linear curve inverts exactly at its own knots: (r*cor(r),
+   * 1/cor(r)) is the same curve read the other way. Each channel's inverse lands on its own
+   * radii, and forcing all three back onto a shared axis would mean resampling two of them.
+   * The resolver builds whichever direction was asked for, so the evaluator below never
+   * inverts anything -- no Newton, no per-pixel search, unlike the polynomial models. */
+  int   knot_n;
+  float knot_r[3][LS_MAX_KNOTS];
+  float knot_c[3][LS_MAX_KNOTS];
+  int   knot_vn;
+  float knot_vr[LS_MAX_KNOTS];
+  float knot_v[LS_MAX_KNOTS];
 } ls_eval_t;
+
+/**
+ * @brief Piecewise-linear lookup over a knot table.
+ *
+ * @param xs the knot positions, ascending, @p n of them.
+ * @param ys the value at each of them.
+ * @param n how many knots.
+ * @param x where to sample. Clamped to the ends rather than extrapolated.
+ *
+ * @details The vendors' own convention, and deliberately not something smoother: their
+ * profiles are DEFINED as the piecewise-linear interpolant of these points, so a spline
+ * through them would be a different correction, not a better one.
+ */
+static inline float ls_eval_knot_lookup(const float *xs, const float *ys, const int n,
+                                        const float x)
+{
+  if(n <= 0) return 1.f;
+  if(x <= xs[0]) return ys[0];
+
+  for(int i = 1; i < n; i++)
+  {
+    if(x <= xs[i])
+    {
+      const float d = xs[i] - xs[i - 1];
+      if(d <= 0.f) return ys[i - 1];
+      return ys[i - 1] + (x - xs[i - 1]) * (ys[i] - ys[i - 1]) / d;
+    }
+  }
+  return ys[n - 1];
+}
+
+/**
+ * @brief The per-channel radial scale a knot table gives at this point.
+ *
+ * @param p the lens resolved at one shooting configuration.
+ * @param c the channel, 0 red / 1 green / 2 blue.
+ * @param x, y a point in normalized coordinates.
+ *
+ * @details No conversion between radius conventions, because there is none to make:
+ * ls_modifier_init_knots() defines this modifier's normalized system to BE the one the
+ * vendors index their tables by -- the distance from the image centre over half the image
+ * diagonal, so 1.0 at the corner. A knot table never shares a modifier with lens-database
+ * calibration data, so nothing has to reconcile the two.
+ */
+static inline float ls_eval_knot_factor(const ls_eval_t *p, const int c, const float x,
+                                        const float y)
+{
+  const float r = LS_SQRT(x * x + y * y);
+  return ls_eval_knot_lookup(p->knot_r[c], p->knot_c[c], p->knot_n, r);
+}
 
 /** @brief Distortion, in place, in normalized coordinates. */
 static inline void ls_eval_dist(const ls_eval_t *p, float *x, float *y)
@@ -436,6 +521,11 @@ static inline void ls_eval_untca(const ls_eval_t *p, float *xr, float *yr, float
  * @brief The coordinate chain: scale, projection and distortion, in direction order.
  *
  * @param p the lens resolved at one shooting configuration.
+ * @param c which channel's geometry to follow, 0 red / 1 green / 2 blue. Only a knot table
+ * distinguishes them -- a vendor profile IS one radial curve per channel, distortion and TCA
+ * measured together rather than modelled as two stages. Every polynomial model puts all
+ * three on the green curve and expresses the difference as a separate TCA stage afterwards,
+ * so for those this argument is ignored. Pass 1 wherever a single geometry is meant.
  * @param x, y a point in normalized coordinates, transformed in place.
  * @return 0 when the point has no source pixel at all, in which case @p x and @p y are
  * untouched and the caller decides what to write.
@@ -450,19 +540,38 @@ static inline void ls_eval_untca(const ls_eval_t *p, float *xr, float *yr, float
  *   reverse   undistortion (250) -> projection (500) -> scale (900)
  * The projection sits in the middle either way; scale moves from first to last, and the
  * resolver has already swapped the projection endpoints and un-reciprocated the scale.
+ *
+ * A knot table occupies the distortion slot, and only that slot: the vendor measured the
+ * lens as shipped, so there is no projection change and no scale baked into its numbers, and
+ * a consumer that asks for either still gets it composed around the table in the order above.
+ * It sits in the FORWARD slot in both directions because the resolver builds the table for
+ * the direction asked for -- inverting a piecewise-linear curve is exact at its own knots,
+ * which is why nothing here iterates the way ls_eval_undist() has to.
  */
-static inline int ls_eval_coord_chain(const ls_eval_t *p, float *x, float *y)
+static inline int ls_eval_coord_chain(const ls_eval_t *p, const int c, float *x, float *y)
 {
   if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
   {
     *x *= p->scale;
     *y *= p->scale;
   }
-  if(p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_undist(p, x, y);
+  if(p->reverse && p->dist_model != LS_EVAL_DIST_KNOTS
+     && (p->enabled & LS_EVAL_ENABLE_DISTORTION))
+    ls_eval_undist(p, x, y);
 
   if((p->enabled & LS_EVAL_ENABLE_GEOMETRY) && !ls_eval_geometry(p, x, y)) return 0;
 
-  if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION)) ls_eval_dist(p, x, y);
+  if(p->dist_model == LS_EVAL_DIST_KNOTS)
+  {
+    if(p->enabled & LS_EVAL_ENABLE_DISTORTION)
+    {
+      const float f = ls_eval_knot_factor(p, c, *x, *y);
+      *x *= f;
+      *y *= f;
+    }
+  }
+  else if(!p->reverse && (p->enabled & LS_EVAL_ENABLE_DISTORTION))
+    ls_eval_dist(p, x, y);
   if(p->reverse && (p->enabled & LS_EVAL_ENABLE_SCALE))
   {
     *x *= p->scale;
@@ -500,20 +609,46 @@ static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *ou
    * Projection sits in the middle either way; scale moves from first to last, and the
    * resolver has already swapped the projection endpoints and un-reciprocated the scale.
    * The TCA subpixel stage runs after the coordinate chain in both directions. */
-  if(!ls_eval_coord_chain(p, &x, &y))
-  {
-    /* No source pixel. NaN is what lensfun writes here too, and every consumer in this
-     * project already checks for it (do_nan_checks in the kernels, isfinite() on the CPU)
-     * before sampling. */
-    for(int k = 0; k < 6; k++) out[k] = (float)(0.0f / 0.0f);
-    return;
-  }
-
   float xr = x, yr = y, xb = x, yb = y;
-  if(p->enabled & LS_EVAL_ENABLE_TCA)
+
+  if(p->dist_model == LS_EVAL_DIST_KNOTS)
   {
-    if(p->reverse) ls_eval_untca(p, &xr, &yr, &xb, &yb);
-    else           ls_eval_tca(p, &xr, &yr, &xb, &yb);
+    /* Three chains, one per channel, because a vendor profile has no single geometry to run
+     * a TCA correction on top of -- the red, green and blue curves ARE the correction, and
+     * the difference between them is the lateral chromatic aberration. Running the chain
+     * three times rather than once-plus-a-delta is what keeps that exact.
+     *
+     * It is also cheap where it is used: a vendor table is measured on the lens as shipped,
+     * so the projection stage is an identity that ls_eval_coord_chain() skips outright, and
+     * what repeats is a multiply and a table lookup.
+     *
+     * Only the green chain decides whether there is a source pixel at all. The three differ
+     * by the TCA amount, tenths of a percent, so a per-channel verdict here could hand the
+     * caller two valid channels and one NaN for the same pixel. */
+    ls_eval_coord_chain(p, 0, &xr, &yr);
+    ls_eval_coord_chain(p, 2, &xb, &yb);
+    if(!ls_eval_coord_chain(p, 1, &x, &y))
+    {
+      for(int k = 0; k < 6; k++) out[k] = (float)(0.0f / 0.0f);
+      return;
+    }
+  }
+  else
+  {
+    if(!ls_eval_coord_chain(p, 1, &x, &y))
+    {
+      /* No source pixel. NaN is what lensfun writes here too, and every consumer in this
+       * project already checks for it (do_nan_checks in the kernels, isfinite() on the CPU)
+       * before sampling. */
+      for(int k = 0; k < 6; k++) out[k] = (float)(0.0f / 0.0f);
+      return;
+    }
+    xr = x; yr = y; xb = x; yb = y;
+    if(p->enabled & LS_EVAL_ENABLE_TCA)
+    {
+      if(p->reverse) ls_eval_untca(p, &xr, &yr, &xb, &yb);
+      else           ls_eval_tca(p, &xr, &yr, &xb, &yb);
+    }
   }
 
   out[0] = (xr + p->center_x) * p->norm_unscale;
@@ -547,6 +682,19 @@ static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *ou
  */
 static inline float ls_eval_vignette_from_r2(const ls_eval_t *p, const float r2)
 {
+  if(p->vig_model == LS_EVAL_VIG_KNOTS)
+  {
+    /* The table already states the multiplier that CORRECTS the falloff, so the direction
+     * is handled the same way the polynomial's is -- reversing puts it back. */
+    const float r = LS_SQRT(r2);
+    const float v = ls_eval_knot_lookup(p->knot_vr, p->knot_v, p->knot_vn, r);
+    /* The table states the falloff -- what the lens DID -- so correcting divides by it and
+     * applying multiplies, which is the same way round as the polynomial below and the same
+     * way round as lensfun's two callbacks. */
+    const float m = p->reverse ? v : ((v != 0.f) ? (1.f / v) : 0.f);
+    return (m > 0.f) ? m : 0.f;
+  }
+
   const float r4 = r2 * r2;
   const float c = 1.f + p->vig_terms[0] * r2 + p->vig_terms[1] * r4
                       + p->vig_terms[2] * r4 * r2;

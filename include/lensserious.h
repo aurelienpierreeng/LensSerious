@@ -64,6 +64,7 @@ typedef enum ls_dist_model_t
   LS_DIST_POLY3,   /**< Rd = Ru · (1 − k1 + k1·Ru²)            terms: k1 */
   LS_DIST_POLY5,   /**< Rd = Ru · (1 + k1·Ru² + k2·Ru⁴)        terms: k1 k2 */
   LS_DIST_PTLENS,  /**< Rd = Ru · (a·Ru³ + b·Ru² + c·Ru + d),  d = 1−a−b−c  terms: a b c */
+  LS_DIST_KNOTS,   /**< Rd = Ru · cor(Ru), cor read from a table. No terms; see ls_knots_t. */
 } ls_dist_model_t;
 
 typedef enum ls_tca_model_t
@@ -77,6 +78,7 @@ typedef enum ls_vig_model_t
 {
   LS_VIG_NONE = 0,
   LS_VIG_PA,       /**< Cd = Cs · (1 + k1·r² + k2·r⁴ + k3·r⁶)  terms: k1 k2 k3 */
+  LS_VIG_KNOTS,    /**< Cd = Cs · v(r), v read from a table. No terms; see ls_knots_t. */
 } ls_vig_model_t;
 
 /** One calibration entry, at one focal length (vignetting: one focal/aperture/distance). */
@@ -133,6 +135,52 @@ typedef struct ls_lens_t
 #define LS_ENABLE_GEOMETRY   (1 << 4)
 
 /**
+ * @brief A lens correction the camera maker measured and wrote into the file, as knots.
+ *
+ * @details The second source of correction data this library resolves, beside the lens
+ * database. Most mirrorless makers -- Sony, Fujifilm, Olympus, and anyone writing DNG
+ * 1.3 opcodes -- embed a profile of the lens that took the picture in its metadata, and
+ * they all express it the same way: a short list of radii and, at each, the factor the
+ * coordinate should be scaled by. Not a model with coefficients; the samples themselves,
+ * meant to be read back with straight-line interpolation between them.
+ *
+ * Two things about the shape of it matter to everything downstream:
+ *
+ * - It is per CHANNEL. `cor_rgb` holds red, green and blue separately, so distortion
+ *   and lateral chromatic aberration arrive measured together rather than as a geometry
+ *   plus a correction on top of it. There is no TCA stage to run afterwards.
+ * - It is measured on the lens as shipped. There is no projection to change and no
+ *   calibration sensor to convert from, which is why this needs none of the arguments
+ *   ls_modifier_init() takes: no crop factor, no aperture, no subject distance, and no
+ *   focal, because the maker already resolved the profile at the focal that was used.
+ *
+ * `radius`, and `vig_radius` with it, are the distance from the IMAGE CENTRE over
+ * half the image diagonal -- 1.0 at the far corner. That is the makers' own convention and
+ * this library adopts it wholesale rather than converting, so the numbers a decoder lifts
+ * out of the file go in unmodified.
+ */
+typedef struct ls_knots_t
+{
+  /** How many distortion/TCA knots, up to LS_MAX_KNOTS. Zero for none. */
+  int   n;
+  /** Ascending radii, #n of them, shared by all three channels. */
+  float radius[LS_MAX_KNOTS];
+  /** At each radius, source_radius / this_radius, per channel: 0 red, 1 green, 2 blue.
+   * The direction is the CORRECTING one -- given a point in the corrected image, where in
+   * the source image it came from -- which is what the makers publish and what a resampler
+   * consumes. Ask ls_modifier_init_knots() for the other one and it inverts the table. */
+  float cor_rgb[3][LS_MAX_KNOTS];
+
+  /** How many vignetting knots. Zero for none; independent of #n. */
+  int   vn;
+  /** Ascending radii for #vig, in the same units as #radius. */
+  float vig_radius[LS_MAX_KNOTS];
+  /** The falloff itself, as the maker measured it: below 1 where the lens darkens. A pixel
+   * is CORRECTED by dividing by it, which is upstream lensfun's convention too. */
+  float vig[LS_MAX_KNOTS];
+} ls_knots_t;
+
+/**
  * @brief A modifier: the lens resolved at one shooting configuration.
  *
  * @details Everything here is a plain value: build it once per commit, hand copies to
@@ -162,6 +210,20 @@ typedef struct ls_modifier_t
   ls_calib_dist_t dist;       /* resolved (interpolated) at the shooting focal */
   ls_calib_tca_t  tca;
   ls_calib_vig_t  vig;
+
+  /* The alternative to the three above: a maker's own measured table, already turned to
+   * face the requested direction. Filled by ls_modifier_init_knots(), left zeroed by
+   * ls_modifier_init(), and never both.
+   *
+   * Shaped the way ls_eval_t holds it rather than the way ls_knots_t states it, because
+   * turning it round is what this struct is for and doing it twice is how the two would
+   * drift. The radii are per channel HERE and shared THERE: inverting sends each channel to
+   * its own set of radii, so only the direction that needs them can carry them. */
+  int   knot_n, knot_vn;
+  float knot_r[3][LS_MAX_KNOTS];
+  float knot_c[3][LS_MAX_KNOTS];
+  float knot_vr[LS_MAX_KNOTS];
+  float knot_v[LS_MAX_KNOTS];
 } ls_modifier_t;
 
 /**
@@ -192,6 +254,55 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
                      float scale, int target_type, int flags, int reverse);
 
 /**
+ * @brief Resolve a maker's embedded profile, in place of a database lens.
+ *
+ * @param mod filled in by this call; nothing in it is owned or must be freed.
+ * @param knots the table, as lifted from the file's metadata. Copied, not retained.
+ * @param width, height the image dimensions, in pixels.
+ * @param scale a linear scaling factor; 1.0 for none.
+ * @param flags which LS_ENABLE_* axes to attempt. LS_ENABLE_TCA has no meaning here and is
+ * ignored: a maker's table is already per channel, so asking for distortion asks for the
+ * chromatic part of it too. LS_ENABLE_GEOMETRY likewise -- there is no projection to change.
+ * @param reverse non-zero for the reverse direction, as in ls_modifier_init().
+ * @return the LS_ENABLE_* flags actually in effect. An axis with no knots is dropped.
+ *
+ * @details The counterpart to ls_modifier_init(), and deliberately the only difference
+ * between the two paths: what comes out is an ls_modifier_t like any other, which
+ * ls_eval_from_modifier() flattens like any other, which the same evaluator and the same
+ * kernels consume like any other. A consumer that already corrects lenses from the database
+ * gains embedded profiles by choosing a different resolver -- not by growing a second pixel
+ * path, and not by touching the one it has.
+ *
+ * That is possible because the models agree on what a correction IS. Every one of them,
+ * polynomial or tabulated, answers the same question: at this radius, by what factor is the
+ * coordinate scaled. So the table takes the distortion slot in the chain and nothing else
+ * moves -- @p scale still composes around it in priority order, and the caller can still
+ * ask ls_modifier_autoscale() what scale removes the borders, because that measures the
+ * chain rather than the model.
+ *
+ * @note @p reverse costs nothing per pixel, unlike the polynomial models. Inverting
+ * r -> r*cor(r) has no closed form for a polynomial, so those models pay a Newton iteration
+ * at every pixel; a piecewise-linear curve inverts by reading the same points the other way
+ * round -- (r*cor(r), 1/cor(r)) -- once, at this call, into a table the same size.
+ *
+ * That inverse is exact AT the knots and second-order between them, since a segment that is
+ * straight going forwards is not straight coming back. Measured on a nine-knot profile with
+ * 2% of distortion at the corner, over a 6000x4000 frame: correcting a point and then
+ * un-correcting it returns it to within **0.13 px** at worst, and the worst case sits at
+ * r = 0.94, mid-segment, exactly where the reasoning says it should. For scale, that is a
+ * sixth of the 0.8 px by which liblensfun's own vectorised row walk differs from
+ * liblensfun's own scalar answer. tests/knots.c is where the number comes from and will
+ * fail if it grows past a quarter of a pixel.
+ *
+ * @note The three channels' inverses land on three different sets of radii, which is why
+ * ls_eval_t carries a radius axis per channel where this input carries one shared. Forcing
+ * them back onto a common axis would mean resampling two of the three, and there is nothing
+ * to gain by it -- the tables are already resident in the block either way.
+ */
+int ls_modifier_init_knots(ls_modifier_t *mod, const ls_knots_t *knots,
+                           int width, int height, float scale, int flags, int reverse);
+
+/**
  * @brief The scale that just removes the black borders a correction leaves behind.
  *
  * @param mod a resolved modifier. Its own scale factor, if it has one, is part of the
@@ -220,10 +331,12 @@ float ls_modifier_autoscale(const ls_modifier_t *mod);
 /**
  * @brief Flatten a resolved modifier into the scalar block a kernel can take by value.
  *
- * @details This is the whole point of the exercise: a correction crosses to the GPU as
- * ~80 bytes of coefficients that every work-item evaluates for itself, instead of a
+ * @details This is the whole point of the exercise: a correction crosses to the GPU as one
+ * fixed 632-byte block that every work-item evaluates for itself, instead of a
  * six-float-per-pixel map that the CPU builds single-threaded and then uploads (measured
- * at 278 ms plus 576 MB of transfer for a 24 Mpx frame).
+ * at 278 ms plus 576 MB of transfer for a 24 Mpx frame). Fixed regardless of which kind of
+ * correction it carries -- a maker's table is a hundred-odd more floats, and the whole
+ * block is still smaller than one row of that map.
  *
  * @return 0 if either pointer is NULL, 1 otherwise.
  */
