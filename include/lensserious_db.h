@@ -105,6 +105,11 @@ typedef struct ls_db_t ls_db_t;
 /** A camera, as far as a correction is concerned. */
 typedef struct ls_camera_t
 {
+  /** The camera's database id. Meaningless against any other database and not stable
+   *  across rebuilds -- but it saves a caller re-deriving it, which cannot be done by
+   *  comparing names: this matches "NIKON D5300" to a row whose model column reads
+   *  "D5300", so the string that found the camera is not the string it is stored under. */
+  long long id;
   float crop_factor;
   /** The camera's mount, as an id into the database it was read from. Meaningless against
    *  any other database, and not stable across rebuilds. Pass it to ls_db_lens_fits_mount(). */

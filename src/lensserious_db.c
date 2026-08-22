@@ -382,7 +382,7 @@ int ls_db_find_camera(ls_db_t *db, const char *maker, const char *model, ls_came
 
   sqlite3_stmt *st = NULL;
   if(sqlite3_prepare_v2(db->sql,
-                        "SELECT c.crop_factor, ifnull(c.mount_id, 0) FROM camera c"
+                        "SELECT c.crop_factor, ifnull(c.mount_id, 0), c.id FROM camera c"
                         " JOIN camera_name m ON m.camera_id = c.id AND m.kind = 'model' AND m.norm = ?1"
                         " WHERE (?3 = 0 OR EXISTS (SELECT 1 FROM camera_name k"
                         "        WHERE k.camera_id = c.id AND k.kind = 'maker' AND k.norm = ?2))"
@@ -401,6 +401,7 @@ int ls_db_find_camera(ls_db_t *db, const char *maker, const char *model, ls_came
   {
     out->crop_factor = (float)sqlite3_column_double(st, 0);
     out->mount_id = sqlite3_column_int64(st, 1);
+    out->id = sqlite3_column_int64(st, 2);
     found = 1;
   }
   sqlite3_finalize(st);
@@ -631,6 +632,7 @@ int ls_db_camera_by_id(ls_db_t *db, long long camera_id, ls_camera_t *out)
     found = 1;
     out->crop_factor = (float)sqlite3_column_double(st, 0);
     out->mount_id = sqlite3_column_int64(st, 1);
+    out->id = camera_id;
   }
   sqlite3_finalize(st);
   return found;
