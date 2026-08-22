@@ -343,6 +343,29 @@ float ls_modifier_autoscale(const ls_modifier_t *mod);
 int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out);
 
 /**
+ * @brief Move @p src's vignetting into @p dst, leaving @p dst's geometry untouched.
+ *
+ * @details For a consumer whose axes do not all come from the same place -- an Olympus body
+ * embeds distortion and lateral CA but no vignetting, so the falloff has to come from the
+ * database while the geometry comes from the file. Resolve one modifier per source, flatten
+ * both, and graft the vignetting across.
+ *
+ * It is a graft rather than a merge because the two halves of ::ls_eval_t are genuinely
+ * independent: vignetting reads vig_scale, vig_center_x/y, vig_model and either vig_terms or
+ * the vignetting knot table, and NOTHING a coordinate transform touches. In particular each
+ * half carries its own normalization, which is what makes this safe across resolvers that do
+ * not share one -- the table path measures radius against the half diagonal, the database
+ * path against lensfun's short side, and neither has to know about the other.
+ *
+ * Cheaper than the alternative, too: a second block would double what a kernel receives by
+ * value, and ::ls_eval_t is already 632 bytes against the 1024 that OpenCL 1.2 guarantees
+ * for a kernel's whole argument list.
+ *
+ * @return 0 if either pointer is NULL, 1 otherwise.
+ */
+int ls_eval_adopt_vignetting(ls_eval_t *dst, const ls_eval_t *src);
+
+/**
  * @brief The geometry map: for @p count output pixels starting at (@p xu, @p yu),
  * write 6 floats per pixel — source coordinates for R, G, B — in pixel space.
  * Bit-for-bit the contract of lfModifier::ApplySubpixelGeometryDistortion(), so a

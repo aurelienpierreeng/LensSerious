@@ -776,6 +776,32 @@ int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
   return 1;
 }
 
+int ls_eval_adopt_vignetting(ls_eval_t *dst, const ls_eval_t *src)
+{
+  if(!dst || !src) return 0;
+
+  /* Every field the vignetting evaluator reads, and no other. Listed rather than memcpy'd
+   * from an offset range because the two halves are interleaved in the struct: a range copy
+   * would work today and silently take a coordinate field the day someone reorders it. */
+  dst->vig_scale = src->vig_scale;
+  dst->vig_center_x = src->vig_center_x;
+  dst->vig_center_y = src->vig_center_y;
+  dst->vig_model = src->vig_model;
+  for(int i = 0; i < 3; i++) dst->vig_terms[i] = src->vig_terms[i];
+
+  dst->knot_vn = src->knot_vn;
+  for(int i = 0; i < src->knot_vn && i < LS_MAX_KNOTS; i++)
+  {
+    dst->knot_vr[i] = src->knot_vr[i];
+    dst->knot_v[i] = src->knot_v[i];
+  }
+
+  /* The enable bit follows the data, or the evaluator would run a model that is not there. */
+  dst->enabled = (dst->enabled & ~LS_EVAL_ENABLE_VIGNETTING)
+                 | (src->enabled & LS_EVAL_ENABLE_VIGNETTING);
+  return 1;
+}
+
 int ls_modifier_apply_subpixel_geometry(const ls_modifier_t *mod,
                                         float xu, float yu, int width, int height,
                                         float *res)
