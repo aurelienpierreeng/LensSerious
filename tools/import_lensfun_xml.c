@@ -47,6 +47,11 @@
 #include <lensfun.h>
 #include <sqlite3.h>
 
+#ifndef LS_HAVE_LF_DB_LOAD_DIRECTORY
+/* Only the pre-0.3.3 fallback in _load_directory() walks a directory itself. */
+#include <dirent.h>
+#endif
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -240,6 +245,48 @@ static char *read_file(const char *path)
   return buf;
 }
 
+/**
+ * @brief Load every XML file in a directory into @p ldb. @return non-zero on success.
+ *
+ * @details lf_db_load_directory() does exactly this and is the obvious call, but it only
+ * arrived in liblensfun 0.3.3. Ubuntu 22.04 -- which is what this project's consumers build
+ * their nightlies on -- still ships 0.3.2, where the symbol does not exist and the link
+ * fails outright. So the directory walk is written out for that case.
+ *
+ * The two loaders also report success in OPPOSITE conventions, which is worth being explicit
+ * about: lf_db_load() returns an lfError, where 0 means success, while lf_db_load_directory()
+ * and lf_db_load_file() return a cbool/lfError pair that do not agree with each other.
+ * Treating them alike made the directory path fail on a directory it had just read correctly
+ * -- a path nothing exercised until a consumer started importing from fetched XML rather than
+ * from the installed database. This function returns one convention: non-zero for success.
+ */
+static int _load_directory(lfDatabase *ldb, const char *dirname)
+{
+#ifdef LS_HAVE_LF_DB_LOAD_DIRECTORY
+  return lf_db_load_directory(ldb, dirname) ? 1 : 0;
+#else
+  DIR *d = opendir(dirname);
+  if(!d) return 0;
+
+  int loaded = 0;
+  const struct dirent *e;
+  while((e = readdir(d)))
+  {
+    const size_t n = strlen(e->d_name);
+    if(n < 5 || strcmp(e->d_name + n - 4, ".xml")) continue;
+
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", dirname, e->d_name);
+    /* Here 0 IS success: lf_db_load_file() returns an lfError, like lf_db_load(). A file
+     * that fails to parse is skipped rather than fatal, which is what the newer
+     * lf_db_load_directory() does too -- it reports success if ANY file loaded. */
+    if(lf_db_load_file(ldb, path) == LF_NO_ERROR) loaded++;
+  }
+  closedir(d);
+  return loaded > 0;
+#endif
+}
+
 int main(int argc, char **argv)
 {
   if(argc < 3)
@@ -273,13 +320,7 @@ int main(int argc, char **argv)
 
   if(xml_dir)
   {
-    /* The two loaders report success in OPPOSITE conventions and it is worth being
-     * explicit about it: lf_db_load() returns an lfError, where 0 means success, while
-     * lf_db_load_directory() returns a cbool, where NON-zero means success. Treating them
-     * alike made the directory path fail on a directory it had just read correctly -- a
-     * path nothing exercised until a consumer started importing from fetched XML rather
-     * than from the installed database. */
-    if(!lf_db_load_directory(ldb, xml_dir))
+    if(!_load_directory(ldb, xml_dir))
     {
       fprintf(stderr, "import: no database loaded from `%s'\n", xml_dir);
       return 1;

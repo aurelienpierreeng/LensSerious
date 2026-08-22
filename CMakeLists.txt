@@ -44,10 +44,28 @@ endif()
 # offline tool run when upstream publishes calibrations, so that dependency never reaches a
 # render: nothing the pixel pipeline links to knows lensfun exists.
 if(LENSFUN_FOUND AND TARGET lensserious_db)
+  # lf_db_load_directory() arrived in liblensfun 0.3.3. Ubuntu 22.04 -- what this project's
+  # consumers build their nightlies on -- still ships 0.3.2, where the symbol is absent and
+  # the link fails with an undefined reference rather than anything that names a version.
+  # Probed rather than inferred from the version string, because a distribution's version is
+  # not a reliable statement about which symbols it exports.
+  include(CheckSymbolExists)
+  set(CMAKE_REQUIRED_INCLUDES ${LENSFUN_INCLUDE_DIRS})
+  set(CMAKE_REQUIRED_LIBRARIES PkgConfig::LENSFUN)
+  check_symbol_exists(lf_db_load_directory "lensfun.h" LS_HAVE_LF_DB_LOAD_DIRECTORY)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_REQUIRED_LIBRARIES)
+
   add_executable(import_lensfun_xml tools/import_lensfun_xml.c)
   target_link_libraries(import_lensfun_xml PRIVATE lensserious_db PkgConfig::LENSFUN)
   target_compile_options(import_lensfun_xml PRIVATE -Wall -Wextra)
   set_target_properties(import_lensfun_xml PROPERTIES C_STANDARD 11)
+  if(LS_HAVE_LF_DB_LOAD_DIRECTORY)
+    target_compile_definitions(import_lensfun_xml PRIVATE LS_HAVE_LF_DB_LOAD_DIRECTORY)
+  else()
+    message(STATUS "liblensfun has no lf_db_load_directory (pre-0.3.3): "
+                   "the importer will walk the directory itself")
+  endif()
 endif()
 
 option(LENSSERIOUS_TESTS "Build the lensfun parity harness" ON)
