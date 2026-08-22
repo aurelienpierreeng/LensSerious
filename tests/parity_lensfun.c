@@ -494,13 +494,28 @@ int main(int argc, char **argv)
           ls_modifier_apply_vignetting(&vmod, xs[xi], H * 0.25f, 8, 1, rowb, 8 * 4 * sizeof(float));
           for(int k = 0; k < 8 * 4; k++)
           {
-            /* Alpha is skipped: upstream's own paths disagree about it. The SSE2
-             * DeVignetting multiplies all four components; the scalar one -- which this
-             * harness forces via the CPU-features interposition -- leaves the fourth
-             * alone. Production runs the SSE2 path on every x86-64, and LensSerious
-             * matches that; comparing alpha against the scalar path here would assert
-             * an upstream inconsistency, not a LensSerious defect. */
-            if((k & 3) == 3) continue;
+            /* Alpha is not compared against upstream, because upstream's own two paths
+             * disagree about it: the SSE2 DeVignetting multiplies all four components, the
+             * scalar one -- which this harness forces via the CPU-features interposition --
+             * leaves the fourth alone. There is no single upstream answer to be faithful to.
+             *
+             * LensSerious leaves it alone, deliberately: the fourth component is not a
+             * colour, so there is no falloff in it to remove, and a consumer keeping a mask
+             * or premultiplied coverage there would have it silently corrupted. That is a
+             * decision this library makes rather than inherits, so it is ASSERTED here
+             * rather than merely excluded -- the row went in at 1.0 and must come back at
+             * exactly 1.0. */
+            if((k & 3) == 3)
+            {
+              if(rowb[k] != 1.f)
+              {
+                if(vig_failed < 3)
+                  printf("VIGFAIL %s crop=%.2f focal=%.1f x=%.0f k=%d  alpha scaled to %.6f,"
+                         " must be untouched\n", lf->Model, crop, focal, xs[xi], k, rowb[k]);
+                vig_failed++;
+              }
+              continue;
+            }
 
             const float d = fabsf(rowa[k] - rowb[k]);
             if(d > worst_vig)

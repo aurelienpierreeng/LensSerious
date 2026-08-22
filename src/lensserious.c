@@ -858,14 +858,27 @@ int ls_modifier_apply_vignetting(const ls_modifier_t *mod,
       for(int i = 0; i < n; i++, px += 4)
       {
         const float m = mbuf[i];
-        /* All FOUR components, alpha included: upstream's apply_multiplier under
-         * LF_CR_4(RED, GREEN, BLUE, UNKNOWN) multiplies the UNKNOWN channel too, and the
-         * harness caught the difference on literally every sampled pixel (k=3,7,11...).
-         * Whether that is wise is not this library's question; parity is. */
+        /* Only THREE components change, but all four are multiplied and the fourth put
+         * back. The fourth is not a colour and there is no falloff in it to remove -- a
+         * lens darkens light, not coverage -- so scaling it corrupts whatever the caller
+         * keeps there: in a raw pipeline that is routinely a mask, and for premultiplied
+         * alpha it would break the invariant outright.
+         *
+         * Written as three multiplies and a skip, the store is a 3-of-4 masked write and
+         * the compiler falls back to scalar. Multiplying the whole pixel keeps it a single
+         * aligned 4-wide operation, and restoring one lane afterwards is one scalar store.
+         *
+         * Upstream lensfun scales all four, under LF_CR_4(RED, GREEN, BLUE, UNKNOWN) -- but
+         * only in its SSE2 path; its own scalar DeVignetting leaves the fourth alone. The
+         * two disagree, so there is no upstream behaviour here to be faithful to, and
+         * tests/parity_lensfun.c has always excluded alpha from the comparison for that
+         * reason. It asserts this instead. */
+        const float a = px[3];
         px[0] *= m;
         px[1] *= m;
         px[2] *= m;
         px[3] *= m;
+        px[3] = a;
       }
     }
   }
