@@ -857,8 +857,44 @@ static float _score_tokens(const ls_tokens_t *pat, const ls_tokens_t *cand)
   return score;
 }
 
+/**
+ * @brief Upstream's crop-factor rule, as a bonus ADDED to a candidate's score.
+ *
+ * @param cam the camera's crop factor; 0 to ignore the rule entirely.
+ * @param calib the crop factor of the sensor the lens was CALIBRATED on.
+ * @return -1 to reject the candidate outright, otherwise a bonus to add.
+ *
+ * @details Ported from _lf_lens_compare_score() (lens.cpp), including its numbers. A
+ * calibration measured on a sensor more than 4% larger than the camera's is rejected: it
+ * does not cover the frame, and no amount of name similarity makes it the right answer.
+ * What survives is graded, and the grading is not monotonic in the obvious direction -- the
+ * peak is a camera slightly SMALLER than the calibration sensor (1.01x to 1.11x), not an
+ * exact match, because a calibration measured on a marginally wider frame covers the whole
+ * of this one.
+ *
+ * ADDED, not multiplied, and that distinction was measured rather than assumed. Upstream's
+ * crop term is 2 to 10 against a total in the tens, so it breaks ties between similarly
+ * named lenses without overriding the name. Scaling a 0..100 token score by it instead lets
+ * it dominate: a lens whose name matched 90% on a 1.534 sensor beat an EXACT name match on
+ * a 1.611 one, 90 against 50, and the whole-database check fell to 94.1%. Upstream's own
+ * numbers, on the same side of the operator upstream puts them, are the right port.
+ */
+static float _crop_score(const float cam, const float calib)
+{
+  if(cam <= 0.01f || calib <= 0.f) return 0.f;   /* unknown: the rule cannot be applied */
+  if(cam < calib * 0.96f) return -1.f;           /* the calibration does not cover the frame */
+
+  if(cam >= calib * 1.41f) return 2.f;
+  if(cam >= calib * 1.31f) return 4.f;
+  if(cam >= calib * 1.21f) return 6.f;
+  if(cam >= calib * 1.11f) return 8.f;
+  if(cam >= calib * 1.01f) return 10.f;
+  if(cam >= calib) return 5.f;
+  return 3.f;                                    /* within the 4% tolerance, but smaller */
+}
+
 int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long long mount_id,
-                     ls_db_match_t *out, int max)
+                     float crop, ls_db_match_t *out, int max)
 {
   if(!db || !db->sql || !model || !out || max <= 0) return -1;
 
@@ -999,11 +1035,29 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
   }
   sqlite3_finalize(st);
 
+  /* The calibration crop factor of every candidate, in one query rather than one per
+   * candidate: the set is small by now, but a round trip each would undo the work the
+   * rarest-token pruning just did. */
+  sqlite3_stmt *cq = NULL;
+  if(crop > 0.01f)
+    sqlite3_prepare_v2(db->sql, "SELECT crop_factor FROM lens WHERE id = ?1", -1, &cq, NULL);
+
   int n = 0;
   for(size_t slot = 0; slot < SLOTS; slot++)
   {
     if(!ids[slot] || best[slot] <= 0.f) continue;
-    const float score = best[slot] + 0.10f * maker_bonus[slot];
+    float score = best[slot] + 0.10f * maker_bonus[slot];
+
+    if(cq)
+    {
+      sqlite3_reset(cq);
+      sqlite3_bind_int64(cq, 1, ids[slot]);
+      const float calib = (sqlite3_step(cq) == SQLITE_ROW)
+                              ? (float)sqlite3_column_double(cq, 0) : 0.f;
+      const float w = _crop_score(crop, calib);
+      if(w < 0.f) continue;           /* rejected: this calibration cannot serve this frame */
+      score += w;
+    }
 
     /* Insertion sort into the caller's top-N: max is small (a GUI shows a handful). */
     int at = n;
@@ -1020,6 +1074,7 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
     }
   }
 
+  if(cq) sqlite3_finalize(cq);
   free(ids);
   free(best);
   free(maker_bonus);

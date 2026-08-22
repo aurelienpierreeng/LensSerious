@@ -118,7 +118,7 @@ int main(int argc, char **argv)
 
       /* us */
       ls_db_match_t got[4];
-      const int n = ls_db_match_lens(db, maker, q[k], 0, got, 4);
+      const int n = ls_db_match_lens(db, maker, q[k], 0, 0.f, got, 4);
       char ls_maker[256] = { 0 }, ls_model[256] = { 0 };
       if(n > 0) ls_db_lens_name(db, got[0].lens_id, ls_maker, sizeof(ls_maker),
                                 ls_model, sizeof(ls_model));
@@ -168,6 +168,70 @@ int main(int argc, char **argv)
     }
   }
 
+  /* --- phase two: the same question, with a CAMERA ---------------------------------
+   *
+   * Everything above passes NULL for lensfun's camera and 0 for our crop factor, so it
+   * never exercises the rule that picks BETWEEN lenses of the same name. Upstream rejects a
+   * calibration measured on a sensor more than 4% larger than the camera's and grades the
+   * rest by how closely the two match, and several lenses in the database differ ONLY in
+   * that. Without this phase the matcher can return a name-identical lens carrying the
+   * wrong calibration, which is what happened on a real Nikon D5300: a full-frame row
+   * instead of the 1.528 one, and 0.19 px of geometry error that no name comparison could
+   * see. */
+  const lfCamera *const *cameras = lf_db_get_cameras(ldb);
+  int crop_asked = 0, crop_agree = 0, crop_shown = 0;
+  for(int i = 0; lenses && lenses[i]; i++)
+  {
+    const lfLens *lf = lenses[i];
+    const char *maker = lf_mlstr_get(lf->Maker);
+    const char *model = lf_mlstr_get(lf->Model);
+    if(!model || !*model || lf->CropFactor <= 0.f) continue;
+
+    /* A REAL camera, the one whose sensor is closest to what this lens was calibrated on.
+     * Synthesising an lfCamera would need its Mount set, and the setter is C++-only; using
+     * a real one also makes this the path Ansel actually takes -- resolve the camera from
+     * EXIF, then resolve the lens against that camera. */
+    const lfCamera *cam = NULL;
+    float best_d = 1e9f;
+    for(int c = 0; cameras && cameras[c]; c++)
+    {
+      const float d = fabsf(cameras[c]->CropFactor - lf->CropFactor);
+      if(d < best_d) { best_d = d; cam = cameras[c]; }
+    }
+    if(!cam) continue;
+
+    /* Our side resolves the same camera by name first, exactly as a consumer does. */
+    ls_camera_t ls_cam;
+    if(ls_db_find_camera(db, lf_mlstr_get(cam->Maker), lf_mlstr_get(cam->Model), &ls_cam) != 1)
+      continue;
+
+    const lfLens **lf_hits = lf_db_find_lenses_hd(ldb, cam, maker, model, 0);
+    ls_db_match_t got[1];
+    const int n = ls_db_match_lens(db, maker, model, ls_cam.mount_id, ls_cam.crop_factor,
+                                   got, 1);
+
+    if(lf_hits && lf_hits[0] && n > 0)
+    {
+      crop_asked++;
+      ls_lens_t ours;
+      const float theirs = lf_hits[0]->CropFactor;
+      const float mine = (ls_db_lens_by_id(db, got[0].lens_id, &ours) == 1)
+                             ? ours.crop_factor : 0.f;
+      /* The CALIBRATION crop of the pick, not its name: two rows can share a name and this
+       * is the field that distinguishes them, so it is the field to compare. */
+      if(theirs == mine) crop_agree++;
+      else if(crop_shown < 8)
+      {
+        fprintf(stderr, "CROP  `%s' on a %.3f body: lensfun picked crop %.3f, us %.3f\n",
+                model, (double)lf->CropFactor, (double)theirs, (double)mine);
+        crop_shown++;
+      }
+    }
+    if(lf_hits) lf_free(lf_hits);
+  }
+  printf("\nmatch: with a camera, the calibration crop of the pick agrees %d/%d (%.1f%%)\n",
+         crop_agree, crop_asked, crop_asked ? 100.0 * crop_agree / crop_asked : 0.0);
+
   printf("\nmatch: agreement with liblensfun's top pick, whole database\n");
   int total_asked = 0, total_ok = 0;
   for(int k = 0; k < 4; k++)
@@ -194,6 +258,17 @@ int main(int argc, char **argv)
   const double full_rate = shapes[0].asked
       ? 100.0 * (shapes[0].agree + shapes[0].same_name) / shapes[0].asked : 0.0;
   int bad = 0;
+  /* The crop rule is what picks BETWEEN lenses of the same name, and getting it wrong
+   * returns a name-identical lens carrying the wrong calibration -- invisible to every
+   * name-based check above. It was found by running a real raw through Ansel, not here,
+   * which is why the floor is high: this phase exists to keep it found. */
+  const double crop_rate = crop_asked ? 100.0 * crop_agree / crop_asked : 0.0;
+  if(crop_rate < 99.0)
+  {
+    fprintf(stderr, "FAIL: with a camera, the pick's calibration crop agrees only %.1f%%\n",
+            crop_rate);
+    bad = 1;
+  }
   if(full_rate < 99.0)
   {
     fprintf(stderr, "FAIL: verbatim names agree only %.1f%% of the time\n", full_rate);

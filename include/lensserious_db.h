@@ -193,6 +193,13 @@ typedef struct ls_db_match_t
  * upstream about their own name often enough that requiring it loses more than it saves.
  * @param mount_id when > 0, only lenses that fit this mount are considered
  * (ls_db_find_camera() supplies it). 0 considers every lens.
+ * @param crop the CAMERA's crop factor (ls_db_find_camera() supplies that too), or 0 to
+ * ignore it. It is not a tie-break: upstream REJECTS a lens whose calibration sensor is
+ * more than 4% larger than the camera's -- such a calibration does not cover the frame --
+ * and then grades what is left by how closely the two match. Several lenses share a name
+ * and differ only in the sensor they were calibrated on, so without this the matcher can
+ * return a name-identical lens with the wrong calibration: measured on a Nikon D5300
+ * (crop 1.534), a full-frame row instead of the 1.528 one, and 0.19 px of geometry.
  * @param db an open database.
  * @param model the free-text name to resolve. Required.
  * @param out caller's array, @p max entries, filled best-first.
@@ -200,7 +207,7 @@ typedef struct ls_db_match_t
  * @return how many candidates were written, or -1 on error.
  */
 int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long long mount_id,
-                     ls_db_match_t *out, int max);
+                     float crop, ls_db_match_t *out, int max);
 
 /** @brief Load a lens by its database id, for a caller that already resolved one. */
 int ls_db_lens_by_id(ls_db_t *db, long long lens_id, ls_lens_t *out);

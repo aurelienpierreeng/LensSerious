@@ -176,7 +176,7 @@ int main(int argc, char **argv)
   for(int i = 0; i < LOOKUPS; i++)
   {
     ls_db_match_t m[1];
-    if(ls_db_match_lens(db, maker, model, 0, m, 1) > 0) ls_db_lens_by_id(db, m[0].lens_id, &lens);
+    if(ls_db_match_lens(db, maker, model, 0, 0.f, m, 1) > 0) ls_db_lens_by_id(db, m[0].lens_id, &lens);
   }
   const double t_ls_find = (now_ms() - t) / LOOKUPS;
   row("find the lens (fuzzy)", t_lf_find, t_ls_find, "ms");
@@ -190,7 +190,7 @@ int main(int argc, char **argv)
   const lfLens *lf = hits[0];
   {
     ls_db_match_t m[1];
-    if(ls_db_match_lens(db, maker, model, 0, m, 1) <= 0
+    if(ls_db_match_lens(db, maker, model, 0, 0.f, m, 1) <= 0
        || ls_db_lens_by_id(db, m[0].lens_id, &lens) != 1)
     {
       fprintf(stderr, "LensSerious cannot find `%s'\n", model);
