@@ -704,6 +704,39 @@ float ls_modifier_autoscale(const ls_modifier_t *mod)
   return mod->reverse ? 1.f / scale : scale;
 }
 
+int ls_modifier_set_projection(ls_modifier_t *mod, const int from_type, const int to_type,
+                               const float focal_mm, const float crop_factor)
+{
+  if(!mod) return 0;
+
+  /* Same test as ls_modifier_init(): every pair is radially expressible except the two that
+   * are not functions of radius alone. */
+  const int radial = (from_type != LS_LENS_PANORAMIC && from_type != LS_LENS_EQUIRECTANGULAR
+                      && to_type != LS_LENS_PANORAMIC && to_type != LS_LENS_EQUIRECTANGULAR
+                      && from_type != LS_LENS_UNKNOWN && to_type != LS_LENS_UNKNOWN);
+
+  mod->geometry_unsupported = (from_type != to_type) && !radial;
+
+  if(!(from_type != to_type && radial && focal_mm > 0.f))
+  {
+    /* Nothing to do -- and the modifier is left exactly as it was found, endpoints and all.
+     * Writing them anyway would be harmless only in theory: with from == to the stage is an
+     * identity mathematically, but it is an identity computed by sending every radius
+     * through an arc-tangent and back, and the float round trip does not return the same
+     * number. That showed up as a whole frame differing by up to 30/65535 on a lens whose
+     * projection nobody had asked to change. */
+    mod->enabled &= ~LS_ENABLE_GEOMETRY;
+    return 0;
+  }
+
+  mod->geom_from = from_type;
+  mod->geom_to = to_type;
+  mod->geom_focal = focal_mm * crop_factor * mod->aspect_ratio_correction
+                    / LS_EVAL_FULL_FRAME_HALF_DIAG_MM;
+  mod->enabled |= LS_ENABLE_GEOMETRY;
+  return 1;
+}
+
 int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
 {
   if(!mod || !out) return 0;

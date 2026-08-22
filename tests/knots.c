@@ -322,6 +322,60 @@ static void test_vignetting(void)
   printf("knots: corner vignetting lift %.4f (%.2f EV)\n", corner, log2f(corner));
 }
 
+/* The projection grafted onto a table-resolved modifier has to land in that modifier's
+ * OWN units, and the two resolvers do not share units: ls_modifier_init() normalizes radius
+ * against the half SHORT SIDE, ls_modifier_init_knots() against the half DIAGONAL.
+ *
+ * The invariant that survives both is physical: the angle subtended at the frame corner is a
+ * property of the lens and the sensor, not of anyone's normalization. Compute it each way
+ * and the two must agree -- which is the whole claim ls_modifier_set_projection() rests on,
+ * and the one that would silently mis-scale every reprojected pixel if the
+ * aspect_ratio_correction factor were dropped or applied twice. */
+static void test_projection_units(void)
+{
+  const float focal = 24.f, crop = 1.53f;
+  const float ar = (float)IMG_W / (float)IMG_H;
+  const float ar_corr = sqrtf(ar * ar + 1.f);
+
+  /* A table-resolved modifier: aspect_ratio_correction is 1, radius 1 is the half diagonal. */
+  ls_knots_t k;
+  _make_identity(&k);
+  ls_modifier_t mk;
+  ls_modifier_init_knots(&mk, &k, IMG_W, IMG_H, 1.f, LS_ENABLE_DISTORTION, 0);
+  CHECK(fabsf(mk.aspect_ratio_correction - 1.f) < 1e-6f,
+        "projection: a table modifier should normalize against the diagonal, got arc=%.4f",
+        mk.aspect_ratio_correction);
+
+  ls_modifier_set_projection(&mk, LS_LENS_FISHEYE, LS_LENS_RECTILINEAR, focal, crop);
+  CHECK((mk.enabled & LS_ENABLE_GEOMETRY) != 0, "projection: geometry did not enable");
+
+  /* The corner sits at radius 1 in these coordinates, and at ar_corr in the other's. */
+  const float theta_knots = atanf(1.f / mk.geom_focal);
+  const float geom_focal_db = focal * crop * ar_corr / 21.633307f;
+  const float theta_db = atanf(ar_corr / geom_focal_db);
+
+  CHECK(fabsf(theta_knots - theta_db) < 1e-5f,
+        "projection: corner half-angle differs between normalizations: %.6f vs %.6f rad",
+        theta_knots, theta_db);
+  printf("knots: corner half-angle %.5f rad, same either way\n", theta_knots);
+
+  /* A pair that is not a function of radius alone is declined, not approximated. */
+  ls_modifier_t mp;
+  ls_modifier_init_knots(&mp, &k, IMG_W, IMG_H, 1.f, LS_ENABLE_DISTORTION, 0);
+  CHECK(ls_modifier_set_projection(&mp, LS_LENS_RECTILINEAR, LS_LENS_PANORAMIC, focal, crop) == 0,
+        "projection: panoramic should be declined");
+  CHECK(mp.geometry_unsupported, "projection: panoramic should raise geometry_unsupported");
+  CHECK((mp.enabled & LS_ENABLE_GEOMETRY) == 0,
+        "projection: a declined change must leave the stage off");
+
+  /* Same projection on both sides is not a change, and must not switch the stage on. */
+  ls_modifier_t mi;
+  ls_modifier_init_knots(&mi, &k, IMG_W, IMG_H, 1.f, LS_ENABLE_DISTORTION, 0);
+  CHECK(ls_modifier_set_projection(&mi, LS_LENS_RECTILINEAR, LS_LENS_RECTILINEAR, focal, crop) == 0,
+        "projection: an identity change should not enable geometry");
+  CHECK(!mi.geometry_unsupported, "projection: an identity change is supported, not refused");
+}
+
 int main(void)
 {
   test_identity();
@@ -330,6 +384,7 @@ int main(void)
   test_refusal();
   test_chain();
   test_vignetting();
+  test_projection_units();
 
   printf("knots: %d failure(s)\n", failures);
   return failures ? 1 : 0;

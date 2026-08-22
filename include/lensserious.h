@@ -329,6 +329,44 @@ int ls_modifier_init_knots(ls_modifier_t *mod, const ls_knots_t *knots,
 float ls_modifier_autoscale(const ls_modifier_t *mod);
 
 /**
+ * @brief Add a projection change to an already-resolved modifier.
+ *
+ * @param mod a modifier from either resolver. Its coordinate system is used as-is.
+ * @param from_type the projection the LENS produces, as ls_lens_type_t.
+ * @param to_type the projection wanted, as ls_lens_type_t.
+ * @param focal_mm the focal the projection runs on. For a lens carrying
+ * `<real-focal-length>` this is NOT the engraved focal -- see ls_modifier_init(), which
+ * derives it and would pass the derived value.
+ * @param crop_factor the crop of the sensor whose HALF DIAGONAL this modifier's coordinates
+ * are normalized against. For a table-resolved modifier that is the camera that took the
+ * picture; for a database-resolved one it is the sensor the lens was CALIBRATED on, because
+ * the shooting crop is already folded into its norm_scale.
+ * @return non-zero if a projection change was enabled.
+ *
+ * @details ls_modifier_init() does this itself; this is for the other resolver. A maker's
+ * embedded table describes the lens in the projection it shipped with and says nothing about
+ * any other, so ls_modifier_init_knots() leaves both endpoints UNKNOWN -- but a consumer
+ * that ALSO knows the lens's type, typically from a database entry matched alongside, can
+ * put the projection back and get the two composed.
+ *
+ * That composes because the projection stage reads only the working radius and #geom_focal,
+ * and the one formula covers both coordinate systems:
+ *
+ *     geom_focal = focal_mm * crop * aspect_ratio_correction / (half of a 36x24 diagonal)
+ *
+ * The aspect_ratio_correction in it is exactly what converts half-diagonal units into the
+ * half-short-side ones ls_modifier_init() normalizes to; a table-resolved modifier stores
+ * 1.0 there because it already measures radius against the half diagonal, so the same
+ * expression lands in the right units without a special case.
+ *
+ * @note Panoramic and equirectangular map x and y differently on either side, so a change
+ * involving one is declined rather than approximated: #geometry_unsupported is raised, the
+ * stage stays off, and this returns 0.
+ */
+int ls_modifier_set_projection(ls_modifier_t *mod, int from_type, int to_type,
+                               float focal_mm, float crop_factor);
+
+/**
  * @brief Flatten a resolved modifier into the scalar block a kernel can take by value.
  *
  * @details This is the whole point of the exercise: a correction crosses to the GPU as one
