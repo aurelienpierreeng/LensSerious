@@ -20,6 +20,18 @@ TCA **poly3/linear** (3355/6), vignetting **pa** (25269 — the only model). Len
 expresses those forms as plain C over a plain struct of coefficients, so the same
 evaluation runs vectorised on the CPU, inside an OpenCL kernel, or anywhere a float goes.
 
+`version_1` is the target on purpose, and there is nothing to gain by moving. Upstream
+publishes a `version_2` tarball, but as of 2026-08 its content is the same calibrations:
+56 files either way, and an identical model census — **zero** entries use the ACM
+(Adobe Camera Model) forms that the version-2 format exists to allow. The only real
+difference is that `<real-focal-length>` became a `real-focal` attribute on
+`<distortion>`. Meanwhile `LF_MAX_DATABASE_VERSION` is still **1** in the liblensfun
+every distribution ships (0.3.4), so feeding it a version-2 file makes it reject every
+one of them outright — measured, not inferred. Revisit if upstream ever publishes ACM
+calibrations; note that ACM distortion is **not radial** (it carries tangential terms and
+is measured in units of focal length), so it would not fit the single assumption every
+model here shares.
+
 Not "the same math, textually" — **the same text**.
 [`include/lensserious_eval.h`](include/lensserious_eval.h) holds the evaluators, and it
 is compiled twice: as C99 into the library, and as OpenCL C by the host's driver. There
@@ -318,15 +330,14 @@ Where the design wins is not arithmetic, it is architecture:
 |---|---|
 | distortion (poly3/poly5/ptlens), TCA (linear/poly3), scaling | ported; 9114 configurations at ≤ 0.0067 px |
 | vignetting (pa) | ported; 4054 configurations at ≤ 3e-6 |
-| projection conversion (fisheye ↔ rectilinear, orthographic, stereographic, equisolid, thoby) | ported and verified; declines for lenses carrying `<real-focal-length>` data, and for panoramic/equirectangular, which are not radially expressible — 42 configurations |
+| projection conversion (fisheye ↔ rectilinear, orthographic, stereographic, equisolid, thoby) | ported and verified; declines only for panoramic/equirectangular, which are not radially expressible — 42 configurations |
 | database (XML → SQLite) + stateless lock-free reader | done; whole database verified field-by-field against liblensfun |
 | fuzzy matching | done; **99.0%** agreement with liblensfun's own top pick over the whole database (100% verbatim, 99.5% maker-stripped), at 0.19 ms a lookup |
 | OpenCL | evaluators compile as OpenCL C from the same header; Ansel consumes them per work-item |
 | map-less (fused) evaluation on the CPU | measured; a win from four threads up, a loss below — see above. Not yet offered as an API: consumers call `ls_eval_map()` per pixel themselves, as `tests/bench_lensfun.c` does |
-| upstream sync (`version_2` conversion tooling) | not started |
 | native XML reader (dropping liblensfun from the importer) | not started |
 | CPU geometry map vectorisation | **open** — the loop is scalar because the model dispatch inside the per-pixel evaluator is loop-invariant and the compiler will not unswitch it |
-| `<real-focal-length>` interpolation | **open** — would let the last projection cases off the fallback path; the schema already has the table, the importer does not fill it |
+| maker profiles embedded in the raw (`ls_knots_t`) | done; the table takes the distortion slot, so the same evaluator and kernels consume it — inverse exact at the knots, 0.13 px worst case over a 6000x4000 frame |
 
 ## Documentation
 

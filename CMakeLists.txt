@@ -56,12 +56,24 @@ if(LENSFUN_FOUND AND TARGET lensserious_db)
   unset(CMAKE_REQUIRED_INCLUDES)
   unset(CMAKE_REQUIRED_LIBRARIES)
 
+  # The conversion is a LIBRARY, in its own target, and this is the only target in the
+  # project that links liblensfun. A consumer rendering pixels links lensserious and
+  # lensserious_db and gets no lensfun dependency with them; a consumer shipping an updater
+  # links this one too, on purpose. Two front ends call it -- the tool below, and Ansel's
+  # ansel-lens-db-update -- and neither carries a copy of it.
+  add_library(lensserious_import STATIC src/lensserious_import.c)
+  target_include_directories(lensserious_import PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(lensserious_import PUBLIC lensserious_db PkgConfig::LENSFUN)
+  target_compile_options(lensserious_import PRIVATE -Wall -Wextra)
+  set_target_properties(lensserious_import PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                                      C_STANDARD 11)
+
   add_executable(import_lensfun_xml tools/import_lensfun_xml.c)
-  target_link_libraries(import_lensfun_xml PRIVATE lensserious_db PkgConfig::LENSFUN)
+  target_link_libraries(import_lensfun_xml PRIVATE lensserious_import)
   target_compile_options(import_lensfun_xml PRIVATE -Wall -Wextra)
   set_target_properties(import_lensfun_xml PROPERTIES C_STANDARD 11)
   if(LS_HAVE_LF_DB_LOAD_DIRECTORY)
-    target_compile_definitions(import_lensfun_xml PRIVATE LS_HAVE_LF_DB_LOAD_DIRECTORY)
+    target_compile_definitions(lensserious_import PRIVATE LS_HAVE_LF_DB_LOAD_DIRECTORY)
   else()
     message(STATUS "liblensfun has no lf_db_load_directory (pre-0.3.3): "
                    "the importer will walk the directory itself")
