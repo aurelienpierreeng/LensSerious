@@ -904,8 +904,18 @@ static void _parse_focal_range(const char *name, float *minf, float *maxf)
   for(const char *c = name; *c; c++)
   {
     if(*c < '0' || *c > '9') continue;
-    /* a number must start at a word boundary, or "35" matches inside "af35" */
-    if(c != name && !(c[-1] == ' ' || c[-1] == '-' || c[-1] == '/')) continue;
+    /* Whitespace or start of string, and NOTHING else -- upstream's regex begins
+     * ([[:space:]]+|^) and this must not be more eager than that.
+     *
+     * Accepting '-' as a boundary too, which is what this did first, half-parses the names
+     * vendors actually write: "XF18-55mmF2.8-4" has no space before the 18, so the 18 is
+     * skipped, the 55 after the dash is taken instead, and an 18-55 zoom is read as a 55mm
+     * prime -- which then rejects the very lens being searched for. Upstream cannot parse
+     * that name either, and answers by leaving the range UNSET, which makes the filter
+     * neutral and the lens findable. Failing to parse is the safe outcome here; parsing
+     * wrongly is not. Measured: six lenses across ten images went from resolved to not
+     * found at all. */
+    if(c != name && c[-1] != ' ') continue;
 
     char *end = NULL;
     const float a = strtof(c, &end);
