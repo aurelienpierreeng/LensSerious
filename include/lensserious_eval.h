@@ -570,7 +570,16 @@ static inline float ls_eval_vignette_from_r2(const ls_eval_t *p, const float r2)
    *
    * Keeping this to a single select matters more than it looks: it is the difference
    * between one divide per pixel and one per four. */
-  const float m = 1.f / c;
+  /* The DIRECTION decides whether the lens's falloff is removed or re-applied, and
+   * upstream implements the two as separate callbacks: ModifyColor_DeVignetting_PA
+   * multiplies by 1/c to correct, ModifyColor_Vignetting_PA multiplies by c to put the
+   * falloff back (mod-color.cpp, priorities 750 and 250). Ignoring the flag here meant the
+   * reverse direction BRIGHTENED the corners it was supposed to darken -- the correction
+   * applied twice instead of undone.
+   *
+   * Still one select on top of the divide: the reciprocal is computed either way, and the
+   * branch is on a field that is constant for the whole frame. */
+  const float m = p->reverse ? c : (1.f / c);
   return (m > 0.f) ? m : 0.f;
 }
 

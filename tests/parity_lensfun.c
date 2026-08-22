@@ -471,13 +471,16 @@ int main(int argc, char **argv)
       }
 
       /* Vignetting parity, where both sides resolved the pa model. */
+      /* Both directions. Upstream corrects the falloff one way and re-applies it the
+       * other, through two different callbacks; testing only the forward one left the
+       * reverse direction free to be wrong, and it was. */
       lfModifier *vref = lf_modifier_new(lf, crop, W, H);
       const int vrefmods = lf_modifier_initialize(vref, lf, LF_PF_F32, focal, 8.f, 1000.f, 1.f,
-                                                  LF_RECTILINEAR, LF_MODIFY_VIGNETTING, 0);
+                                                  LF_RECTILINEAR, LF_MODIFY_VIGNETTING, rev);
       ls_modifier_t vmod;
       const int vmymods = ls_modifier_init(&vmod, &lens, crop, W, H, focal, 8.f, 1000.f, 1.f,
                                           LS_LENS_UNKNOWN,
-                                           LS_ENABLE_VIGNETTING, 0);
+                                           LS_ENABLE_VIGNETTING, rev);
       if((vrefmods & LF_MODIFY_VIGNETTING) && (vmymods & LS_ENABLE_VIGNETTING))
       {
         vig_compared++;
