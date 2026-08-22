@@ -273,7 +273,13 @@ int main(int argc, char **argv)
 
   if(xml_dir)
   {
-    if(lf_db_load_directory(ldb, xml_dir) != 0)
+    /* The two loaders report success in OPPOSITE conventions and it is worth being
+     * explicit about it: lf_db_load() returns an lfError, where 0 means success, while
+     * lf_db_load_directory() returns a cbool, where NON-zero means success. Treating them
+     * alike made the directory path fail on a directory it had just read correctly -- a
+     * path nothing exercised until a consumer started importing from fetched XML rather
+     * than from the installed database. */
+    if(!lf_db_load_directory(ldb, xml_dir))
     {
       fprintf(stderr, "import: no database loaded from `%s'\n", xml_dir);
       return 1;
