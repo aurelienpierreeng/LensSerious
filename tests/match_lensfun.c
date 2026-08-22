@@ -262,6 +262,11 @@ int main(int argc, char **argv)
    * returns a name-identical lens carrying the wrong calibration -- invisible to every
    * name-based check above. It was found by running a real raw through Ansel, not here,
    * which is why the floor is high: this phase exists to keep it found. */
+  /* Not 100%: two entries in the current database are cases where liblensfun picks a
+   * DIFFERENTLY NAMED lens and this picks the exact match -- "Sigma 70-200mm f/2.8 EX DG
+   * HSM" against upstream's choice of the EX DG *OS* HSM, and the same shape for a Tokina
+   * 11-20. Disagreeing with the oracle there is the right answer, so the floor sits below
+   * them rather than the code being bent to reproduce them. */
   const double crop_rate = crop_asked ? 100.0 * crop_agree / crop_asked : 0.0;
   if(crop_rate < 99.0)
   {

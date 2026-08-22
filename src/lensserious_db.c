@@ -1122,6 +1122,24 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
   /* The calibration crop factor of every candidate, in one query rather than one per
    * candidate: the set is small by now, but a round trip each would undo the work the
    * rarest-token pruning just did. */
+  /* The exact terms -- crop factor and focal range -- are tie-breaks, NOT score terms, and
+   * this constant is what makes them so. Their REJECTS stay absolute (a calibration that
+   * cannot cover the sensor, or a 20mm answering a 50mm query, is out whatever its name);
+   * their positive weights are scaled far below the resolution of a name score so that they
+   * can only order candidates whose names are otherwise equal.
+   *
+   * The distinction is not cosmetic, and both halves of it were measured. Upstream ships
+   * "Nikon AF-S Nikkor 50mm f/1.4G" twice, one row carrying a stray "160" in its name and
+   * no vignetting or TCA data; the names differ by 1.36 and the crop term, added at full
+   * weight, was worth 3 -- so the emptier row won on a D7200 and the render silently lost
+   * two corrections. Conversely the Sigma 70-200mm and Tokina 11-20mm have rows whose names
+   * are IDENTICAL and differ only in calibration sensor, and there the crop term is the only
+   * thing that can choose; weakening it uniformly (which was the first attempt) got the
+   * Nikon right and those two wrong.
+   *
+   * Name first, exact facts to break ties, is what satisfies both. */
+  const float EXACT_TIE = 1e-4f;
+
   float q_minf = 0.f, q_maxf = 0.f;
   /* The RAW name, not the normalised one. Normalisation collapses punctuation, so
    * "16-35mm" arrives as "16 35mm" and a zoom reads as a 35mm prime -- which then rejects
@@ -1151,15 +1169,16 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
 
       const float w = _crop_score(crop, calib);
       if(w < 0.f) continue;           /* rejected: this calibration cannot serve this frame */
-      score += w;
+      /* A TIE-BREAK, scaled so it cannot outweigh a name difference -- see EXACT_TIE. */
+      score += w * EXACT_TIE;
 
       /* The focal range the NAME claims, as upstream's hard filter. A 50mm query must not
        * resolve to a 20mm lens however well the rest of the tokens line up. */
       const int fmin = _compare_num(q_minf, c_minf);
       const int fmax = _compare_num(q_maxf, c_maxf);
       if(fmin < 0 || fmax < 0) continue;
-      if(fmin > 0) score += 10.f;
-      if(fmax > 0) score += 10.f;
+      if(fmin > 0) score += 10.f * EXACT_TIE;
+      if(fmax > 0) score += 10.f * EXACT_TIE;
     }
 
     /* Insertion sort into the caller's top-N: max is small (a GUI shows a handful). */
