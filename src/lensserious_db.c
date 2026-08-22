@@ -636,6 +636,56 @@ int ls_db_camera_by_id(ls_db_t *db, long long camera_id, ls_camera_t *out)
   return found;
 }
 
+int ls_db_mount_name(ls_db_t *db, long long mount_id, char *out, size_t out_size)
+{
+  if(!db || !db->sql || !out || out_size == 0) return -1;
+  out[0] = '\0';
+
+  sqlite3_stmt *st = NULL;
+  if(sqlite3_prepare_v2(db->sql, "SELECT name FROM mount WHERE id = ?1", -1, &st, NULL)
+     != SQLITE_OK)
+  {
+    _db_err(db, "prepare mount name");
+    return -1;
+  }
+  sqlite3_bind_int64(st, 1, mount_id);
+  int found = 0;
+  if(sqlite3_step(st) == SQLITE_ROW)
+  {
+    const char *n = (const char *)sqlite3_column_text(st, 0);
+    if(n)
+    {
+      snprintf(out, out_size, "%s", n);
+      found = 1;
+    }
+  }
+  sqlite3_finalize(st);
+  return found;
+}
+
+int ls_db_lenses_for_mount(ls_db_t *db, long long mount_id, long long *out_ids, int max)
+{
+  if(!db || !db->sql) return -1;
+
+  sqlite3_stmt *st = NULL;
+  if(sqlite3_prepare_v2(db->sql,
+                        "SELECT lens_id FROM lens_mount WHERE mount_id = ?1 ORDER BY lens_id",
+                        -1, &st, NULL) != SQLITE_OK)
+  {
+    _db_err(db, "prepare lenses for mount");
+    return -1;
+  }
+  sqlite3_bind_int64(st, 1, mount_id);
+  int n = 0;
+  while(sqlite3_step(st) == SQLITE_ROW)
+  {
+    if(out_ids && n < max) out_ids[n] = sqlite3_column_int64(st, 0);
+    n++;
+  }
+  sqlite3_finalize(st);
+  return (out_ids && n > max) ? max : n;
+}
+
 int ls_db_meta(ls_db_t *db, const char *key, char *out, size_t out_size)
 {
   if(!db || !db->sql || !key || !out || out_size == 0) return -1;

@@ -284,6 +284,36 @@ int ls_db_camera_name(ls_db_t *db, long long camera_id, char *maker, size_t make
 /** @brief Load a camera by its database id, for a caller that already resolved one. */
 int ls_db_camera_by_id(ls_db_t *db, long long camera_id, ls_camera_t *out);
 
+/**
+ * @brief A mount's name.
+ *
+ * @param db an open database.
+ * @param mount_id the mount, as ls_db_find_camera() reported it.
+ * @param out caller's buffer; always NUL-terminated when @p out_size is non-zero.
+ * @param out_size its size.
+ * @return 1 when the mount exists, 0 when it does not, -1 on error.
+ *
+ * @note Upstream encodes a real fact in the SPELLING: a mount whose name starts with a
+ * lower-case letter belongs to a fixed-lens camera. That is how a consumer tells a compact
+ * from an interchangeable-lens body, so the name has to be reachable, not just its id.
+ */
+int ls_db_mount_name(ls_db_t *db, long long mount_id, char *out, size_t out_size);
+
+/**
+ * @brief The lenses made for one mount.
+ *
+ * @param db an open database.
+ * @param mount_id the mount.
+ * @param out_ids caller's array, or NULL to count only.
+ * @param max the length of @p out_ids.
+ * @return how many ids were written (or how many exist, if @p out_ids is NULL), or -1.
+ *
+ * @note The lens's OWN mounts, without upstream's compatibility table. A fixed-lens camera
+ * has a mount of its own and exactly the lenses built into it, and widening that to
+ * compatible mounts would answer with lenses that physically cannot be on the camera.
+ */
+int ls_db_lenses_for_mount(ls_db_t *db, long long mount_id, long long *out_ids, int max);
+
 #ifdef __cplusplus
 }
 #endif
