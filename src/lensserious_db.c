@@ -858,6 +858,90 @@ static float _score_tokens(const ls_tokens_t *pat, const ls_tokens_t *cand)
 }
 
 /**
+ * @brief Pull the focal range out of a lens NAME, the way upstream does.
+ *
+ * @param name the RAW name, as the caller supplied it. Not the normalised form: that
+ * collapses punctuation, and the dash in "16-35mm" is load-bearing here.
+ * @param minf, maxf filled with the focal range in mm, or left at 0 when the name carries
+ * none.
+ *
+ * @details lensfun's FindLenses() runs GuessParameters() on the query string, which regexes
+ * the focal length and aperture out of it and then uses them as HARD FILTERS: a candidate
+ * whose focal range differs by more than 1% is rejected outright (_lf_compare_num returns
+ * -1 and the score becomes 0). Without this, a query is only a bag of tokens, and "Sigma
+ * 50mm f/1.4 DG HSM" can resolve to a Sigma 20mm f/1.4 DG HSM -- measured, on a real image,
+ * with the calibration silently wrong by a factor of 2.5 in focal length.
+ *
+ * Hand-scanned rather than regexed on purpose: <regex.h> is POSIX and this has to build
+ * with MSVC. The rule implemented is upstream's first and by far most common pattern --
+ * a number, optionally a dash and a second number, then "mm" -- which is what real EXIF
+ * lens names carry. Names it cannot read leave the range at 0, which the filter treats as
+ * "no opinion", exactly as upstream's neutral case does. Agreement is measured over the
+ * whole database by tests/match_lensfun.c rather than argued from the regex.
+ */
+static void _parse_focal_range(const char *name, float *minf, float *maxf)
+{
+  *minf = 0.f;
+  *maxf = 0.f;
+  if(!name) return;
+
+  /* Upstream refuses to read numbers out of these (GuessParameters): a teleconverter or an
+   * adapter carries a magnification, not a focal length, and reading "1.4x" as a focal
+   * rejects every lens it could pair with. Same list, same reason. */
+  static const char *const not_a_lens[]
+      = { "adapter", "reducer", "booster", "extender", "converter", "ext.", "ext ", NULL };
+  for(int i = 0; not_a_lens[i]; i++)
+  {
+    /* case-insensitively, since this sees raw names */
+    for(const char *h = name; *h; h++)
+    {
+      const char *a = h, *b = not_a_lens[i];
+      while(*a && *b && ((*a | 32) == (*b | 32))) { a++; b++; }
+      if(!*b) return;
+    }
+  }
+
+  for(const char *c = name; *c; c++)
+  {
+    if(*c < '0' || *c > '9') continue;
+    /* a number must start at a word boundary, or "35" matches inside "af35" */
+    if(c != name && !(c[-1] == ' ' || c[-1] == '-' || c[-1] == '/')) continue;
+
+    char *end = NULL;
+    const float a = strtof(c, &end);
+    if(!end || end == c) continue;
+
+    float b = a;
+    const char *p = end;
+    if(*p == '-')
+    {
+      char *end2 = NULL;
+      const float t = strtof(p + 1, &end2);
+      if(end2 && end2 != p + 1) { b = t; p = end2; }
+    }
+    while(*p == ' ') p++;
+    if((p[0] == 'm' || p[0] == 'M') && (p[1] == 'm' || p[1] == 'M') && a > 0.f && b >= a)
+    {
+      *minf = a;
+      *maxf = b;
+      return;                 /* upstream takes the first match too */
+    }
+    c = end - 1;
+  }
+}
+
+/**
+ * @brief Upstream's _lf_compare_num(): a numeric field as a filter, not a score.
+ * @return -1 reject, +1 a strong yes, 0 no opinion (either side unknown).
+ */
+static int _compare_num(const float a, const float b)
+{
+  if(a == 0.f || b == 0.f) return 0;
+  const float r = a / b;
+  return (r <= 0.99f || r >= 1.01f) ? -1 : +1;
+}
+
+/**
  * @brief Upstream's crop-factor rule, as a bonus ADDED to a candidate's score.
  *
  * @param cam the camera's crop factor; 0 to ignore the rule entirely.
@@ -1038,9 +1122,17 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
   /* The calibration crop factor of every candidate, in one query rather than one per
    * candidate: the set is small by now, but a round trip each would undo the work the
    * rarest-token pruning just did. */
+  float q_minf = 0.f, q_maxf = 0.f;
+  /* The RAW name, not the normalised one. Normalisation collapses punctuation, so
+   * "16-35mm" arrives as "16 35mm" and a zoom reads as a 35mm prime -- which then rejects
+   * the very lens being searched for. Measured: 99.0% agreement fell to 68.9%. */
+  _parse_focal_range(model, &q_minf, &q_maxf);
+
   sqlite3_stmt *cq = NULL;
-  if(crop > 0.01f)
-    sqlite3_prepare_v2(db->sql, "SELECT crop_factor FROM lens WHERE id = ?1", -1, &cq, NULL);
+  if(crop > 0.01f || q_minf > 0.f)
+    sqlite3_prepare_v2(db->sql,
+                       "SELECT crop_factor, min_focal, max_focal FROM lens WHERE id = ?1",
+                       -1, &cq, NULL);
 
   int n = 0;
   for(size_t slot = 0; slot < SLOTS; slot++)
@@ -1052,11 +1144,22 @@ int ls_db_match_lens(ls_db_t *db, const char *maker, const char *model, long lon
     {
       sqlite3_reset(cq);
       sqlite3_bind_int64(cq, 1, ids[slot]);
-      const float calib = (sqlite3_step(cq) == SQLITE_ROW)
-                              ? (float)sqlite3_column_double(cq, 0) : 0.f;
+      if(sqlite3_step(cq) != SQLITE_ROW) continue;
+      const float calib = (float)sqlite3_column_double(cq, 0);
+      const float c_minf = (float)sqlite3_column_double(cq, 1);
+      const float c_maxf = (float)sqlite3_column_double(cq, 2);
+
       const float w = _crop_score(crop, calib);
       if(w < 0.f) continue;           /* rejected: this calibration cannot serve this frame */
       score += w;
+
+      /* The focal range the NAME claims, as upstream's hard filter. A 50mm query must not
+       * resolve to a 20mm lens however well the rest of the tokens line up. */
+      const int fmin = _compare_num(q_minf, c_minf);
+      const int fmax = _compare_num(q_maxf, c_maxf);
+      if(fmin < 0 || fmax < 0) continue;
+      if(fmin > 0) score += 10.f;
+      if(fmax > 0) score += 10.f;
     }
 
     /* Insertion sort into the caller's top-N: max is small (a GUI shows a handful). */
