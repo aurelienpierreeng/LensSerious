@@ -461,9 +461,16 @@ int main(int argc, char **argv)
   {
     char buf[256];
     const time_t now = time(NULL);
-    struct tm tm_utc;
-    gmtime_r(&now, &tm_utc);
-    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+    /* gmtime_r is POSIX and absent on MinGW, where this tool now builds because a consumer
+     * generates its database at build time. gmtime() returns a pointer into static storage,
+     * which matters not at all here: this is a single-threaded offline importer writing one
+     * timestamp. The three-way #ifdef the "thread-safe" variants would need is more risk
+     * than the race it would prevent. */
+    const struct tm *tm_utc = gmtime(&now);
+    if(tm_utc)
+      strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm_utc);
+    else
+      snprintf(buf, sizeof(buf), "unknown");
 
     char lf_version[64];
     snprintf(lf_version, sizeof(lf_version), "lensfun %d.%d.%d.%d",
@@ -513,6 +520,16 @@ int main(int argc, char **argv)
   lf_db_destroy(ldb);
 
   /* Atomic swap: see @ref rebuild. */
+  /* POSIX rename() replaces an existing destination atomically; the Windows CRT's does
+   * NOT -- it fails outright when the target exists, so a rebuild over yesterday's database
+   * would leave the .tmp behind and report failure. Removing the target first gives up
+   * atomicity on Windows only, which is the correct trade for a build-time tool: the file
+   * is generated, not user data, and a failed build is more visible than a torn write.
+   * Everywhere else the rename stays atomic, which is what lets a reader hold the database
+   * open with immutable=1 while it is being replaced. */
+#ifdef _WIN32
+  unlink(out_path);
+#endif
   if(rename(tmp_path, out_path) != 0)
   {
     fprintf(stderr, "import: cannot rename `%s' to `%s': %s\n",
