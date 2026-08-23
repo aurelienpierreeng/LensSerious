@@ -364,7 +364,8 @@ float ls_modifier_autoscale(const ls_modifier_t *mod);
  * that ALSO knows the lens's type, typically from a database entry matched alongside, can
  * put the projection back and get the two composed.
  *
- * That composes because the projection stage reads only the working radius and #geom_focal,
+ * That composes because the projection stage reads only the working radius and
+ * ls_modifier_t::geom_focal,
  * and the one formula covers both coordinate systems:
  *
  *     geom_focal = focal_mm * crop * aspect_ratio_correction / (half of a 36x24 diagonal)
@@ -375,7 +376,8 @@ float ls_modifier_autoscale(const ls_modifier_t *mod);
  * expression lands in the right units without a special case.
  *
  * @note Panoramic and equirectangular map x and y differently on either side, so a change
- * involving one is declined rather than approximated: #geometry_unsupported is raised, the
+ * involving one is declined rather than approximated: ls_modifier_t::geometry_unsupported
+ * is raised, the
  * stage stays off, and this returns 0.
  */
 int ls_modifier_set_projection(ls_modifier_t *mod, int from_type, int to_type,

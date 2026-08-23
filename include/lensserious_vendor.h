@@ -126,9 +126,10 @@ typedef enum ls_vendor_type_t
   LS_VENDOR_OLYMPUS
 } ls_vendor_type_t;
 
-/** @brief Sony maker-note tables, verbatim: fixed-point int16 at #nc implicit, evenly
- *  spaced radii. The fixed-point scales (1/16384 distortion, 1/2^21 CA, 1/8192
- *  vignetting) are applied by ls_vendor_resolve(), never by the extractor. */
+/** @brief Sony maker-note tables, verbatim: fixed-point int16 over `nc` evenly spaced
+ *  radii, which the file leaves implicit. The fixed-point scales (1/16384 distortion,
+ *  1/2^21 CA, 1/8192 vignetting) are applied by ls_vendor_resolve(), never by the
+ *  extractor. */
 typedef struct ls_vendor_sony_t
 {
   int nc;                 /**< knots; valid data has 2..16 */
