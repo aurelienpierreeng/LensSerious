@@ -14,6 +14,7 @@
 #include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 
 #define LS_DB_SCHEMA_VERSION 4
@@ -84,14 +85,38 @@ static char *_db_build_uri(const char *path)
   return uri;
 }
 
-ls_db_t *ls_db_open(const char *path)
+int ls_db_schema_required(void)
 {
+  return LS_DB_SCHEMA_VERSION;
+}
+
+ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *schema_found)
+{
+  if(status) *status = LS_DB_OPEN_NO_FILE;
+  if(schema_found) *schema_found = -1;
+
   char *uri = _db_build_uri(path);
   if(!uri) return NULL;
+
+  /* Asked before SQLite is, because SQLite cannot answer it: a missing file and an
+   * unreadable one both come back SQLITE_CANTOPEN, and those want different fixes. Only
+   * for a plain path -- a `file:' URI may carry parameters that decide what is opened. */
+  if(strncmp(path, "file:", 5) != 0)
+  {
+    FILE *probe = fopen(path, "rb");
+    if(!probe)
+    {
+      if(status) *status = (errno == ENOENT) ? LS_DB_OPEN_NO_FILE : LS_DB_OPEN_UNREADABLE;
+      free(uri);
+      return NULL;
+    }
+    fclose(probe);
+  }
 
   ls_db_t *db = (ls_db_t *)calloc(1, sizeof(ls_db_t));
   if(!db)
   {
+    if(status) *status = LS_DB_OPEN_UNREADABLE;
     free(uri);
     return NULL;
   }
@@ -105,6 +130,7 @@ ls_db_t *ls_db_open(const char *path)
   free(uri);
   if(rc != SQLITE_OK)
   {
+    if(status) *status = LS_DB_OPEN_UNREADABLE;
     ls_db_close(db);
     return NULL;
   }
@@ -117,10 +143,23 @@ ls_db_t *ls_db_open(const char *path)
 
   if(db->schema_version != LS_DB_SCHEMA_VERSION)
   {
+    /* Version 0 is what PRAGMA user_version returns for any SQLite file that never set
+     * one, so a file that is not ours at all lands here rather than under UNREADABLE. The
+     * version is reported either way and says which it was. */
+    if(status) *status = LS_DB_OPEN_SCHEMA;
+    if(schema_found) *schema_found = db->schema_version;
     ls_db_close(db);
     return NULL;
   }
+
+  if(status) *status = LS_DB_OPEN_OK;
+  if(schema_found) *schema_found = db->schema_version;
   return db;
+}
+
+ls_db_t *ls_db_open(const char *path)
+{
+  return ls_db_open_status(path, NULL, NULL);
 }
 
 void ls_db_close(ls_db_t *db)

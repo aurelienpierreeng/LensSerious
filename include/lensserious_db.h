@@ -117,6 +117,24 @@ typedef struct ls_camera_t
 } ls_camera_t;
 
 /**
+ * @brief Why ls_db_open() refused.
+ *
+ * @details The three are not interchangeable to whoever has to fix it: a missing file is an
+ * installation that never produced one, an unreadable file is a permissions or storage
+ * problem, and a schema mismatch is a database that is perfectly fine but was built for a
+ * different reader -- typically one left behind in a prefix by an older install. Reporting
+ * all three as "not found", which is what a bare NULL invites, sent users looking for a
+ * file that was sitting exactly where they expected it.
+ */
+typedef enum ls_db_open_status_t
+{
+  LS_DB_OPEN_OK = 0,     /**< opened, and of a schema this build reads */
+  LS_DB_OPEN_NO_FILE,    /**< nothing at that path */
+  LS_DB_OPEN_UNREADABLE, /**< present, but it could not be opened or is not a database */
+  LS_DB_OPEN_SCHEMA      /**< a database, of a schema version this build does not read */
+} ls_db_open_status_t;
+
+/**
  * @brief Open a database for reading.
  *
  * @param path a filesystem path, or a `file:` URI. Either way it is opened read-only and
@@ -124,8 +142,24 @@ typedef struct ls_camera_t
  * and `immutable` are forced.
  * @return NULL if the file cannot be opened or is not a LensSerious database of a schema
  * version this build understands. Never fails for concurrency reasons: there are none.
+ *
+ * @see ls_db_open_status() when the caller has to tell somebody WHY it failed.
  */
 ls_db_t *ls_db_open(const char *path);
+
+/**
+ * @brief ls_db_open(), reporting why it refused.
+ *
+ * @param status out, may be NULL: which of #ls_db_open_status_t happened.
+ * @param schema_found out, may be NULL: on #LS_DB_OPEN_SCHEMA, the version the file
+ * actually carries; -1 when no version could be read. Compare against
+ * ls_db_schema_required().
+ * @return the open database, or NULL. Identical to ls_db_open() in every other respect.
+ */
+ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *schema_found);
+
+/** @brief The schema version this build reads. A file carrying any other is refused. */
+int ls_db_schema_required(void);
 
 /** @brief Release a handle. Safe on NULL. */
 void ls_db_close(ls_db_t *db);
