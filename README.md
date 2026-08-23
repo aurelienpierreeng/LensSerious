@@ -108,7 +108,8 @@ harness for the first time:
 
 ## Design
 
-Three layers, and only the first ends up inside a pixel pipeline.
+Three layers, and only the first ends up inside a pixel pipeline. A fourth, optional
+module decodes the correction tables some cameras embed in their raw files.
 
 **The evaluators** — [`include/lensserious_eval.h`](include/lensserious_eval.h). Six closed
 forms plus a projection stage, over `ls_eval_t`: a flat block of ~30 scalars, no pointers,
@@ -143,6 +144,20 @@ and it buys `GuessParameters()`, which infers the focal and aperture ranges that
 from the XML for ~95% of lenses and that feed the vignetting interpolation's distance
 metric. Nothing in the schema or the reader knows liblensfun exists, so a native XML reader
 later replaces one file.
+
+**The vendor decoders** — [`include/lensserious_vendor.h`](include/lensserious_vendor.h).
+Sony, Fujifilm, DNG OpcodeList3 and Olympus write their own lens profile into every raw
+file; `ls_vendor_resolve()` turns whichever format the file holds into the same `ls_knots_t`
+the knot evaluators consume, so past that call nothing knows which maker wrote it. The
+boundary is drawn where the *numbers* appear: this library links no metadata reader, and
+the input structs carry values the consumer's EXIF library already decoded — the header
+documents, tag by tag, what to extract, with worked examples from Ansel. The one byte-level
+format, DNG's OpcodeList3 blob, is parsed here (`ls_vendor_parse_dng_opcodelist3()`),
+because that format is correction knowledge, not metadata knowledge. **Licensed
+GPL-3.0-or-later, unlike the rest of this library**: the decoders are ported from darktable
+code whose copyright this project does not own, which is why they are a separate build
+target (`lensserious_vendor`, `LENSSERIOUS_VENDOR=OFF` to omit) rather than part of the
+LGPL core.
 
 ## Measurements
 

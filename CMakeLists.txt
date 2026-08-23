@@ -11,6 +11,19 @@ if(NOT MSVC)
 endif()
 set_target_properties(lensserious PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
 
+# The vendor decoders are a SEPARATE target for a licensing reason, not an architectural
+# one: they are ported from GPL-licensed darktable code whose copyright this project does
+# not own, so they are GPL-3.0-or-later where everything else here is LGPL. A consumer
+# links lensserious_vendor only if the GPL suits it; nothing else depends on it.
+option(LENSSERIOUS_VENDOR "Build the maker-profile decoders (GPL-3.0-or-later)" ON)
+if(LENSSERIOUS_VENDOR)
+  add_library(lensserious_vendor STATIC src/lensserious_vendor.c)
+  target_include_directories(lensserious_vendor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(lensserious_vendor PUBLIC lensserious)
+  target_compile_options(lensserious_vendor PRIVATE -Wall -Wextra)
+  set_target_properties(lensserious_vendor PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 11)
+endif()
+
 # The database is an OPTIONAL component: the evaluators above stay dependency-free, since
 # they are what ends up inside a pixel pipeline. Only the lookup half needs SQLite.
 option(LENSSERIOUS_DB "Build the SQLite database reader and importer" ON)
@@ -117,6 +130,16 @@ if(LENSSERIOUS_TESTS)
   target_compile_options(knots PRIVATE -Wall -Wextra)
   set_target_properties(knots PROPERTIES C_STANDARD 11)
   add_test(NAME knots COMMAND knots)
+
+  # Same reasoning for the vendor decoders: no second implementation to compare against,
+  # so ranges and contract properties are what is asserted.
+  if(LENSSERIOUS_VENDOR)
+    add_executable(vendor tests/vendor.c)
+    target_link_libraries(vendor PRIVATE lensserious_vendor)
+    target_compile_options(vendor PRIVATE -Wall -Wextra)
+    set_target_properties(vendor PROPERTIES C_STANDARD 11)
+    add_test(NAME vendor COMMAND vendor)
+  endif()
 
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
