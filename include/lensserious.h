@@ -300,6 +300,19 @@ int ls_modifier_init(ls_modifier_t *mod, const ls_lens_t *lens,
  * ls_eval_t carries a radius axis per channel where this input carries one shared. Forcing
  * them back onto a common axis would mean resampling two of the three, and there is nothing
  * to gain by it -- the tables are already resident in the block either way.
+ *
+ * @note @p flags decides which axes the table serves, and the distortion/TCA pair is not
+ * free. Pass both and the three per-channel curves are evaluated as measured. Pass
+ * DISTORTION alone and every channel follows the GREEN curve -- the aberration is stripped
+ * exactly, since green IS the geometry the maker measured and the other two are defined
+ * relative to it -- leaving another TCA model free to run after.
+ *
+ * Passing TCA ALONE is accepted but does nothing useful, and deliberately so: there is no
+ * separate aberration in the table to apply. It would have to be the ratio of each channel's
+ * curve to green, resampled onto whatever radius axis the other resolver normalizes against
+ * -- a different convention again (see ls_modifier_set_projection()) -- and it would be the
+ * maker's departure from a geometry that is not theirs. A consumer wanting that combination
+ * should be prepared to answer the physical objection before the mechanical one.
  */
 int ls_modifier_init_knots(ls_modifier_t *mod, const ls_knots_t *knots,
                            int width, int height, float scale, int flags, int reverse);
