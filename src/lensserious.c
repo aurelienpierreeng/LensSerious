@@ -446,7 +446,7 @@ _Static_assert(sizeof(ls_eval_t) == 8 * sizeof(float)      /* the coordinate sys
                                   + 2 * sizeof(int)        /* geom_from, geom_to */
                                   + 2 * sizeof(float)      /* geom_focal, reverse */
                                   + 12 * sizeof(float)     /* the terms */
-                                  + 2 * sizeof(int)        /* knot_n, knot_vn */
+                                  + 3 * sizeof(int)        /* knot_axes, knot_n, knot_vn */
                                   + (6 * LS_MAX_KNOTS      /* knot_r, knot_c */
                                      + 2 * LS_MAX_KNOTS)   /* knot_vr, knot_v */
                                         * sizeof(float),
@@ -585,6 +585,11 @@ int ls_modifier_init_knots(ls_modifier_t *mod, const ls_knots_t *knots,
   }
   else
     mod->scale = 1.f;
+
+  /* What the caller asked this table to serve. A caller wanting the table's geometry but
+   * another source's chromatic aberration passes DISTORTION alone, and the evaluator then
+   * runs every channel down the green curve. */
+  mod->knot_axes = flags & (LS_ENABLE_DISTORTION | LS_ENABLE_TCA);
 
   const int n = (knots->n > LS_MAX_KNOTS) ? LS_MAX_KNOTS : knots->n;
   if((flags & LS_ENABLE_DISTORTION) && n > 0 && _knot_axis_ascends(knots->radius, n))
@@ -771,6 +776,7 @@ int ls_eval_from_modifier(const ls_modifier_t *mod, ls_eval_t *out)
    * direction -- ls_modifier_init_knots() did both -- so this is a copy and nothing else.
    * Whichever kind of modifier this is, the other kind's fields stay at the memset zero,
    * and dist_model/vig_model are what the evaluator reads to tell them apart. */
+  out->knot_axes = mod->knot_axes;
   out->knot_n = mod->knot_n;
   for(int c = 0; c < 3; c++)
     for(int i = 0; i < mod->knot_n; i++)

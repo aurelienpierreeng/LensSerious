@@ -193,7 +193,9 @@ static void test_channels(void)
   _make_profile(&k);
 
   ls_eval_t p;
-  _resolve(&p, &k, 1.f, LS_ENABLE_DISTORTION, 0);
+  /* BOTH axes: the table's per-channel curves are distortion and lateral CA together, and
+   * asking for both is what keeps the three of them separate. */
+  _resolve(&p, &k, 1.f, LS_ENABLE_DISTORTION | LS_ENABLE_TCA, 0);
 
   /* At the corner the table says red is 0.25% further out than green. The map must
    * reproduce that ratio on the radius, and reproduce it on BOTH axes -- a per-channel
@@ -376,6 +378,45 @@ static void test_projection_units(void)
   CHECK(!mi.geometry_unsupported, "projection: an identity change is supported, not refused");
 }
 
+/* A consumer may want the maker's geometry but somebody else's chromatic aberration -- a
+ * user typing their own coefficients, say. Asking the table for DISTORTION alone has to
+ * strip the aberration out of it, or the two corrections both land and the fringing is
+ * over-corrected by exactly the maker's amount. */
+static void test_distortion_without_tca(void)
+{
+  ls_knots_t k;
+  _make_profile(&k);
+
+  ls_eval_t both, dist_only;
+  _resolve(&both, &k, 1.f, LS_ENABLE_DISTORTION | LS_ENABLE_TCA, 0);
+  _resolve(&dist_only, &k, 1.f, LS_ENABLE_DISTORTION, 0);
+
+  const float x = (float)(IMG_W - 1), y = (float)(IMG_H - 1);
+  float ob[6], od[6];
+  ls_eval_map(&both, x, y, ob);
+  ls_eval_map(&dist_only, x, y, od);
+
+  const float cx = IMG_W * 0.5f, cy = IMG_H * 0.5f;
+  const float rr = hypotf(od[0] - cx, od[1] - cy);
+  const float rg = hypotf(od[2] - cx, od[3] - cy);
+  const float rb = hypotf(od[4] - cx, od[5] - cy);
+
+  CHECK(fabsf(rr - rg) < 1e-3f && fabsf(rb - rg) < 1e-3f,
+        "dist-only: channels must coincide, got R %.3f G %.3f B %.3f", rr, rg, rb);
+
+  /* And the geometry it does apply is the green curve unchanged -- stripping the aberration
+   * must not move the picture. */
+  CHECK(fabsf(od[2] - ob[2]) < 1e-3f && fabsf(od[3] - ob[3]) < 1e-3f,
+        "dist-only: green moved, %.4f,%.4f against %.4f,%.4f", od[2], od[3], ob[2], ob[3]);
+
+  /* The aberration really was there to strip. */
+  const float rrb = hypotf(ob[0] - cx, ob[1] - cy);
+  CHECK(fabsf(rrb - rg) > 1.f,
+        "dist-only: the profile carries no aberration, so this proves nothing");
+  printf("knots: distortion-only collapses R-G spread %.2f px to %.2f px\n",
+         fabsf(rrb - rg), fabsf(rr - rg));
+}
+
 int main(void)
 {
   test_identity();
@@ -385,6 +426,7 @@ int main(void)
   test_chain();
   test_vignetting();
   test_projection_units();
+  test_distortion_without_tca();
 
   printf("knots: %d failure(s)\n", failures);
   return failures ? 1 : 0;

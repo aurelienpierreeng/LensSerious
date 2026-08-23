@@ -219,6 +219,8 @@ typedef struct ls_modifier_t
    * turning it round is what this struct is for and doing it twice is how the two would
    * drift. The radii are per channel HERE and shared THERE: inverting sends each channel to
    * its own set of radii, so only the direction that needs them can carry them. */
+  /** Which axes the table serves, LS_ENABLE_* bits. See ls_eval_t::knot_axes. */
+  int   knot_axes;
   int   knot_n, knot_vn;
   float knot_r[3][LS_MAX_KNOTS];
   float knot_c[3][LS_MAX_KNOTS];

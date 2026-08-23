@@ -185,6 +185,14 @@ typedef struct ls_eval_t
    * radii, and forcing all three back onto a shared axis would mean resampling two of them.
    * The resolver builds whichever direction was asked for, so the evaluator below never
    * inverts anything -- no Newton, no per-pixel search, unlike the polynomial models. */
+  /** Which axes the knot table serves, as LS_EVAL_ENABLE_* bits.
+   *
+   * A maker's curve is distortion and lateral CA together -- green IS the distortion, and
+   * each channel's departure from green IS the aberration. So a consumer that wants the
+   * table's geometry but somebody else's CA asks for DISTORTION alone, and every channel
+   * then follows the green curve, leaving the ordinary TCA stage free to run after it.
+   * Asking for both is the usual case and keeps the three-curve evaluation. */
+  int   knot_axes;
   int   knot_n;
   float knot_r[3][LS_MAX_KNOTS];
   float knot_c[3][LS_MAX_KNOTS];
@@ -565,7 +573,11 @@ static inline int ls_eval_coord_chain(const ls_eval_t *p, const int c, float *x,
   {
     if(p->enabled & LS_EVAL_ENABLE_DISTORTION)
     {
-      const float f = ls_eval_knot_factor(p, c, *x, *y);
+      /* Green for every channel when the table is not serving TCA: that strips the
+       * aberration out of the curve and leaves pure distortion, which is what lets a
+       * different TCA source run on top without the two corrections being applied twice. */
+      const int curve = (p->knot_axes & LS_EVAL_ENABLE_TCA) ? c : 1;
+      const float f = ls_eval_knot_factor(p, curve, *x, *y);
       *x *= f;
       *y *= f;
     }
@@ -611,12 +623,14 @@ static inline void ls_eval_map(const ls_eval_t *p, float xu, float yu, float *ou
    * The TCA subpixel stage runs after the coordinate chain in both directions. */
   float xr = x, yr = y, xb = x, yb = y;
 
-  if(p->dist_model == LS_EVAL_DIST_KNOTS)
+  if(p->dist_model == LS_EVAL_DIST_KNOTS && (p->knot_axes & LS_EVAL_ENABLE_TCA))
   {
-    /* Three chains, one per channel, because a vendor profile has no single geometry to run
-     * a TCA correction on top of -- the red, green and blue curves ARE the correction, and
-     * the difference between them is the lateral chromatic aberration. Running the chain
-     * three times rather than once-plus-a-delta is what keeps that exact.
+    /* Three chains, one per channel, because a vendor profile serving BOTH axes has no
+     * single geometry to run a TCA correction on top of -- the red, green and blue curves
+     * ARE the correction, and the difference between them is the lateral chromatic
+     * aberration. Running the chain three times rather than once-plus-a-delta keeps that
+     * exact. When the table serves distortion alone every channel follows green instead,
+     * and the branch below runs the requested TCA model after it.
      *
      * It is also cheap where it is used: a vendor table is measured on the lens as shipped,
      * so the projection stage is an identity that ls_eval_coord_chain() skips outright, and
