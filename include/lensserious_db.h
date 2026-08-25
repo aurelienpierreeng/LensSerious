@@ -158,6 +158,24 @@ ls_db_t *ls_db_open(const char *path);
  */
 ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *schema_found);
 
+/**
+ * @brief ls_db_open_status(), with the sentence a user can act on.
+ *
+ * @details #ls_db_open_status_t says which KIND of failure it was, which is enough to
+ * choose the advice. It is not enough to diagnose one: #LS_DB_OPEN_UNREADABLE covers the
+ * file the operating system would not open and the file SQLite would not open, and those
+ * are different faults with different fixes. This reports whichever of the two happened,
+ * in the words of whoever refused -- including, on the SQLite side, the URI the path was
+ * converted into, since on Windows that conversion is where a readable file gets lost.
+ *
+ * @param error out, may be NULL: a one-line reason, always NUL-terminated, empty on
+ * success and on #LS_DB_OPEN_NO_FILE for a file that is simply absent.
+ * @param error_size the size of @p error in bytes. 256 is enough for any message here.
+ * @return the open database, or NULL. Identical to ls_db_open_status() otherwise.
+ */
+ls_db_t *ls_db_open_diagnostic(const char *path, ls_db_open_status_t *status,
+                               int *schema_found, char *error, size_t error_size);
+
 /** @brief The schema version this build reads. A file carrying any other is refused. */
 int ls_db_schema_required(void);
 

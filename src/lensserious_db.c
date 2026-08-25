@@ -43,6 +43,13 @@ static void _db_err(ls_db_t *db, const char *what)
  * A bare path has to be percent-encoded before it can become a URI -- '?' and '#' in a
  * directory name would otherwise be read as the start of the query, and SQLite would open
  * some other file, or none.
+ *
+ * A Windows path needs three more conversions, and SQLite performs none of them: a
+ * backslash is an ordinary character inside a URI, a drive letter is recognised only in a
+ * path that begins `/X:/', and a UNC path's leading `//' reads as an authority. All three
+ * are documented as the caller's job (sqlite.org/uri.html, "how to convert a filename into
+ * a URI"); this function did none of them, and handed SQLite `file:C:\ansel\lenses.db'
+ * for a file the probe below opens with fopen() without trouble.
  */
 static char *_db_build_uri(const char *path)
 {
@@ -50,7 +57,8 @@ static char *_db_build_uri(const char *path)
 
   const int is_uri = strncmp(path, "file:", 5) == 0;
   const size_t len = strlen(path);
-  /* Worst case: every byte percent-encoded, plus the scheme and our parameters. */
+  /* Worst case: every byte percent-encoded, plus the scheme, the '/' a drive letter
+   * gets, our parameters and the terminator -- 27 bytes of the 64. */
   char *uri = (char *)malloc(len * 3 + 64);
   if(!uri) return NULL;
 
@@ -64,9 +72,33 @@ static char *_db_build_uri(const char *path)
   {
     memcpy(uri, "file:", 5);
     w = 5;
+
+#ifdef _WIN32
+    /* `C:\ansel' -> `/C:/ansel'. Only on Windows: a backslash is a perfectly ordinary
+     * character in a POSIX filename, and a POSIX file may legitimately be called `C:x'. */
+    const int has_drive_letter = len >= 2 && path[1] == ':'
+                                 && ((path[0] >= 'a' && path[0] <= 'z')
+                                     || (path[0] >= 'A' && path[0] <= 'Z'));
+    /* A UNC path needs two MORE slashes, not none: `//server/...' straight after the scheme
+     * reads as the authority `server', which SQLite rejects outright unless it was built
+     * with SQLITE_ALLOW_URI_AUTHORITY. Four slashes leave the authority empty and hand the
+     * VFS `//server/...', which is the UNC path Windows wanted. */
+    const int is_unc = !has_drive_letter && len >= 2 && (path[0] == '/' || path[0] == '\\')
+                       && (path[1] == '/' || path[1] == '\\');
+    if(has_drive_letter) uri[w++] = '/';
+    if(is_unc)
+    {
+      uri[w++] = '/';
+      uri[w++] = '/';
+    }
+#endif
+
     for(size_t i = 0; i < len; i++)
     {
-      const unsigned char c = (unsigned char)path[i];
+      unsigned char c = (unsigned char)path[i];
+#ifdef _WIN32
+      if(c == '\\') c = '/';
+#endif
       if(c == '?' || c == '#' || c == '%')
       {
         static const char hex[] = "0123456789ABCDEF";
@@ -79,7 +111,15 @@ static char *_db_build_uri(const char *path)
     }
   }
 
-  const char *sep = strchr(uri, '?') ? "&" : "?";
+  /* Terminated BEFORE anything reads it. The strchr() below used to run off the end of a
+   * buffer nothing had terminated yet: whether it found a '?' was down to whatever the
+   * allocator left in the heap, and when it did, our parameters were appended with '&' to
+   * a URI that had no query string -- so `mode=ro&immutable=1' became part of the FILENAME,
+   * SQLite looked for a file by that name, and a perfectly readable lenses.db came back
+   * SQLITE_CANTOPEN. A percent-encoded path can no longer contain a '?' of its own, so
+   * only a URI the caller built can already carry a query string. */
+  uri[w] = '\0';
+  const char *sep = (is_uri && strchr(uri, '?')) ? "&" : "?";
   w += (size_t)snprintf(uri + w, 64, "%smode=ro&immutable=1", sep);
   uri[w] = '\0';
   return uri;
@@ -90,13 +130,20 @@ int ls_db_schema_required(void)
   return LS_DB_SCHEMA_VERSION;
 }
 
-ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *schema_found)
+ls_db_t *ls_db_open_diagnostic(const char *path, ls_db_open_status_t *status,
+                               int *schema_found, char *error, size_t error_size)
 {
   if(status) *status = LS_DB_OPEN_NO_FILE;
   if(schema_found) *schema_found = -1;
+  if(error && error_size) error[0] = '\0';
 
   char *uri = _db_build_uri(path);
-  if(!uri) return NULL;
+  if(!uri)
+  {
+    if(status) *status = LS_DB_OPEN_UNREADABLE;
+    if(error && error_size) snprintf(error, error_size, "out of memory building the URI");
+    return NULL;
+  }
 
   /* Asked before SQLite is, because SQLite cannot answer it: a missing file and an
    * unreadable one both come back SQLITE_CANTOPEN, and those want different fixes. Only
@@ -107,6 +154,7 @@ ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *s
     if(!probe)
     {
       if(status) *status = (errno == ENOENT) ? LS_DB_OPEN_NO_FILE : LS_DB_OPEN_UNREADABLE;
+      if(error && error_size) snprintf(error, error_size, "fopen: %s", strerror(errno));
       free(uri);
       return NULL;
     }
@@ -117,6 +165,7 @@ ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *s
   if(!db)
   {
     if(status) *status = LS_DB_OPEN_UNREADABLE;
+    if(error && error_size) snprintf(error, error_size, "out of memory");
     free(uri);
     return NULL;
   }
@@ -127,13 +176,21 @@ ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *s
   const int rc = sqlite3_open_v2(uri, &db->sql,
                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_URI,
                                  NULL);
-  free(uri);
   if(rc != SQLITE_OK)
   {
     if(status) *status = LS_DB_OPEN_UNREADABLE;
+    /* The URI, not the path: the two differ on Windows, and which one SQLite was actually
+     * handed is the whole question when a file the probe above just read is refused here.
+     * sqlite3_errmsg() is valid on a handle open_v2() failed on -- it only returns nothing
+     * useful when the handle itself could not be allocated. */
+    if(error && error_size)
+      snprintf(error, error_size, "SQLite refused `%s': %s (%d)", uri,
+               db->sql ? sqlite3_errmsg(db->sql) : sqlite3_errstr(rc), rc);
+    free(uri);
     ls_db_close(db);
     return NULL;
   }
+  free(uri);
 
   sqlite3_stmt *st = NULL;
   if(sqlite3_prepare_v2(db->sql, "PRAGMA user_version", -1, &st, NULL) == SQLITE_OK
@@ -148,6 +205,15 @@ ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *s
      * version is reported either way and says which it was. */
     if(status) *status = LS_DB_OPEN_SCHEMA;
     if(schema_found) *schema_found = db->schema_version;
+    if(error && error_size)
+    {
+      if(db->schema_version < 0)
+        snprintf(error, error_size, "no readable schema version: %s",
+                 sqlite3_errmsg(db->sql));
+      else
+        snprintf(error, error_size, "schema v%d, this build reads v%d", db->schema_version,
+                 LS_DB_SCHEMA_VERSION);
+    }
     ls_db_close(db);
     return NULL;
   }
@@ -157,9 +223,14 @@ ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *s
   return db;
 }
 
+ls_db_t *ls_db_open_status(const char *path, ls_db_open_status_t *status, int *schema_found)
+{
+  return ls_db_open_diagnostic(path, status, schema_found, NULL, 0);
+}
+
 ls_db_t *ls_db_open(const char *path)
 {
-  return ls_db_open_status(path, NULL, NULL);
+  return ls_db_open_diagnostic(path, NULL, NULL, NULL, 0);
 }
 
 void ls_db_close(ls_db_t *db)
