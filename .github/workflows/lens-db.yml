@@ -1,0 +1,182 @@
+# Publish the upstream lensfun calibrations as a LensSerious SQLite database.
+#
+# Consumers used to fetch https://lensfun.github.io/db/version_1.tar.bz2 themselves at
+# configure time and convert it on the spot. That needs liblensfun on every build machine,
+# needs the network in the middle of a build, and pins nothing: the URL is a rolling
+# artifact, so two builds of one commit could ship different calibrations, and neither
+# could say which. Doing the conversion once, here, and committing the result with its
+# hash makes the database an ordinary pinned input -- which is also the only shape a
+# sandboxed build (Flatpak, and any offline distribution build) can consume.
+#
+# Published under db/v<schema>/, where <schema> is the PRAGMA user_version in
+# src/schema.sql. A reader refuses a database whose schema it does not know
+# (LS_DB_SCHEMA_VERSION, lensserious_db.c), so a bump must not overwrite what existing
+# consumers are pinned to: it starts a new directory instead, and the old one simply stops
+# being refreshed until they follow.
+name: Lens database
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and commit even if upstream has not changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  UPSTREAM_URL: https://lensfun.github.io/db/version_1.tar.bz2
+
+jobs:
+  publish:
+    name: Convert and publish
+    if: github.repository == 'aurelienpierreeng/LensSerious' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      # The importer stamps built_utc into the database's meta table, so no two runs
+      # produce the same bytes. Committing on a schedule alone would therefore add a
+      # multi-megabyte blob to the history every night while saying nothing new. The
+      # upstream tarball's hash is the thing that actually decides whether there is
+      # anything to do.
+      - name: Decide whether upstream moved
+        id: check
+        run: |
+          schema=$(sed -n 's/^PRAGMA user_version *= *\([0-9]\+\) *;.*/\1/p' src/schema.sql | head -1)
+          if [[ -z "${schema}" ]]; then
+            echo "could not read PRAGMA user_version from src/schema.sql" >&2
+            exit 1
+          fi
+          curl -fsSL --retry 3 -o upstream.tar.bz2 "${UPSTREAM_URL}"
+          upstream_sha=$(sha256sum upstream.tar.bz2 | cut -d' ' -f1)
+          recorded=$(jq -r '.source.sha256 // ""' "db/v${schema}/manifest.json" 2>/dev/null || true)
+
+          echo "schema=${schema}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${upstream_sha}" >> "$GITHUB_OUTPUT"
+          if [[ "${upstream_sha}" == "${recorded}" && "${{ inputs.force }}" != "true" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged (${upstream_sha}); nothing to publish." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream ${upstream_sha}, recorded '${recorded:-none}' -- rebuilding v${schema}." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # libglib2.0-dev is not optional despite not being a lensfun package: lensfun.pc
+      # declares Requires: glib-2.0, so without it pkg_check_modules reports lensfun itself
+      # as not found. liblensfun-data-v1 is what the parity checks below compare against.
+      - name: Install dependencies
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            liblensfun-dev liblensfun-data-v1 libglib2.0-dev libsqlite3-dev \
+            pkg-config cmake ninja-build
+
+      - name: Build the importer
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLENSSERIOUS_REQUIRE_LENSFUN=ON
+          cmake --build build
+
+      - name: Convert
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          schema=${{ steps.check.outputs.schema }}
+          # A relative directory name, because the importer records it verbatim in the
+          # database's meta.source row: "lensfun-xml" is provenance, an absolute runner
+          # path is noise.
+          rm -rf lensfun-xml
+          mkdir -p lensfun-xml
+          tar xjf upstream.tar.bz2 -C lensfun-xml
+          count=$(find lensfun-xml -name '*.xml' | wc -l)
+          if [[ "${count}" -eq 0 ]]; then
+            echo "upstream tarball contained no XML" >&2
+            exit 1
+          fi
+
+          mkdir -p "db/v${schema}"
+          ./build/import_lensfun_xml src/schema.sql "db/v${schema}/lenses.db" lensfun-xml
+          echo "Converted ${count} XML files." >> "$GITHUB_STEP_SUMMARY"
+
+      # Consumers ship the XML next to the database: it is the baseline an on-machine
+      # rebuild starts from, so that a user who calibrates one lens ends up with that lens
+      # on top of the fifteen hundred we publish, rather than a database holding only
+      # theirs. Packed with a fixed order, owner and mtime so the archive is a function of
+      # its contents alone.
+      - name: Pack the source XML
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          schema=${{ steps.check.outputs.schema }}
+          ( cd lensfun-xml && tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime='@0' -cJf - *.xml ) > "db/v${schema}/lensfun-xml.tar.xz"
+
+      # Never publish a database nothing can read. parity_db replays calibrations against
+      # liblensfun's own answers and match_lensfun exercises the fuzzy lookup, both against
+      # the file that is about to be committed rather than a build-tree copy.
+      - name: Verify the database
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          schema=${{ steps.check.outputs.schema }}
+          ./build/parity_db "db/v${schema}/lenses.db"
+          ./build/match_lensfun "db/v${schema}/lenses.db"
+
+      - name: Write the manifest
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          schema=${{ steps.check.outputs.schema }}
+          UPSTREAM_SHA=${{ steps.check.outputs.upstream_sha }} \
+          SCHEMA=${schema} \
+          python3 - <<'PY'
+          import hashlib, json, os, datetime
+
+          schema = int(os.environ["SCHEMA"])
+          directory = f"db/v{schema}"
+          entries = {}
+          for name in ("lenses.db", "lensfun-xml.tar.xz"):
+              path = os.path.join(directory, name)
+              data = open(path, "rb").read()
+              entries[name] = {
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "size": len(data),
+              }
+
+          manifest = {
+              "schema_version": schema,
+              "updated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "source": {
+                  "url": os.environ["UPSTREAM_URL"],
+                  "sha256": os.environ["UPSTREAM_SHA"],
+              },
+              "files": entries,
+          }
+          with open(os.path.join(directory, "manifest.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=1, sort_keys=True)
+              f.write("\n")
+          PY
+
+      # [skip ci] because the parity suite has nothing to say about a data-only commit,
+      # and this one already ran the database half of it above.
+      - name: Commit
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          schema=${{ steps.check.outputs.schema }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "db/v${schema}"
+          if git diff --cached --quiet; then
+            echo "Nothing to commit." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "db: refresh v${schema} from upstream ${{ steps.check.outputs.upstream_sha }} [skip ci]"
+          git push origin HEAD:${{ github.ref_name }}
