@@ -209,6 +209,28 @@ rewrite:
   **any** thread concurrently at each query, with no mutex, no shared handle. Per *process*, it is much faster,
   per *application*, it is marginally slower to fetch lens data but doesn't wait on other threads.
 
+### The published database
+
+`db/v<schema>/` holds the conversion, rebuilt daily by `.github/workflows/lens-db.yml` and
+committed only when upstream actually moved:
+
+| file | what it is |
+|---|---|
+| `lenses.db` | the SQLite database a consumer ships and reads |
+| `lensfun-xml.tar.xz` | the calibrations it was built from, the baseline an on-machine rebuild starts from |
+| `manifest.json` | sha256 and size for both, plus the hash of the upstream tarball they came from |
+
+A consumer that used to fetch `version_1.tar.bz2` and convert it during its own build needed
+liblensfun on every build machine, needed the network in the middle of a build, and pinned
+nothing — the upstream URL is a rolling artifact, so two builds of one commit could ship
+different calibrations and neither could say which. Fetching a hashed file named in a
+manifest is an ordinary pinned input instead, and it is the only shape a sandboxed build
+(Flatpak, and any offline distribution build) can consume at all.
+
+The directory is keyed by `PRAGMA user_version`, because a reader refuses a database whose
+schema it does not know. A schema bump starts a new directory rather than overwriting what
+existing consumers are pinned to; the old one stops being refreshed until they follow.
+
 ### Processing the pixels
 
 Paid per image, and the part a GPU can take.
