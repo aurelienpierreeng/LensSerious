@@ -121,9 +121,34 @@ jobs:
           ( cd lensfun-xml && tar --sort=name --owner=0 --group=0 --numeric-owner \
               --mtime='@0' -cJf - *.xml ) > "db/v${schema}/lensfun-xml.tar.xz"
 
-      # Never publish a database nothing can read. parity_db replays calibrations against
-      # liblensfun's own answers and match_lensfun exercises the fuzzy lookup, both against
-      # the file that is about to be committed rather than a build-tree copy.
+      # parity_db and match_lensfun compare against liblensfun's answers, and liblensfun
+      # answers from whatever lf_db_load() finds on this machine -- which is the runner's
+      # liblensfun-data-v1 package, a snapshot years behind what we just converted. Comparing
+      # 1564 freshly converted lenses against 1304 packaged ones is not a test of the
+      # importer, it is a test of how far Ubuntu's data has drifted: the first run of this
+      # job reported 8363 failures, 1233 of them lenses "resolved to a same-named sibling"
+      # because a corpus that does not contain the real lens makes name resolution pick a
+      # wrong one.
+      #
+      # So give liblensfun the same corpus. lf_db_load() takes whichever of the system,
+      # system-updates and user-updates databases carries the newest timestamp.txt, whole --
+      # measured, not assumed: planting 8 of the 56 files here dropped the comparison from
+      # 1564 lenses to 145, and planting all 56 reproduces the local run exactly (parity
+      # pass, match 99.0%).
+      - name: Point liblensfun at the calibrations we just converted
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          updates="${HOME}/.local/share/lensfun/updates/version_1"
+          rm -rf "${updates}"
+          mkdir -p "${updates}"
+          cp lensfun-xml/*.xml "${updates}/"
+          # Newer than any packaged database; the upstream tarball ships no timestamp of
+          # its own, which is why lensfun-update-data writes one too.
+          date +%s > "${updates}/timestamp.txt"
+
+      # Never publish a database nothing can read, or one whose fields disagree with the
+      # calibrations it was built from. Run against the file about to be committed, not a
+      # build-tree copy.
       - name: Verify the database
         if: steps.check.outputs.changed == 'true'
         run: |
