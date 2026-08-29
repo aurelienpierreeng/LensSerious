@@ -1,0 +1,18 @@
+{
+ "files": {
+  "lenses.db": {
+   "sha256": "f94438dc8495ab7b6a02ca71d16414aa6f62516519144c1bbe7f61a915353b58",
+   "size": 3940352
+  },
+  "lensfun-xml.tar.xz": {
+   "sha256": "33eba33dd9c6872aa632bbd5a2e28a6520a607f83a3f60f4c6afda9c1d64cd23",
+   "size": 397500
+  }
+ },
+ "schema_version": 4,
+ "source": {
+  "sha256": "c4af00b805bf9d551ee84d0511ba8fed1bbcc452276fb2417a8ac4991f631b74",
+  "url": "https://lensfun.github.io/db/version_1.tar.bz2"
+ },
+ "updated": "2026-08-29T10:49:28Z"
+}
