@@ -1,18 +1,18 @@
 {
  "files": {
   "lenses.db": {
-   "sha256": "13cf3e90a42e82bd92b78f9a8b51228df640ebf234f1391d2e79773b54c9a6cb",
+   "sha256": "e50a08f49406b74879f0b4cac5ce6fdab8e0ed45e69fbc9c6f126c3c7c48b69f",
    "size": 3964928
   },
   "lensfun-xml.tar.xz": {
-   "sha256": "79ef17290a1f1d21fa4e84eee5bf9237c2319bc173982fc5c358e49f89cf603b",
-   "size": 400480
+   "sha256": "25c02965a43398d9e7d46ce7e8b6b4e79a4748dcb8c5f8c38ad02c154bfd9115",
+   "size": 400432
   }
  },
  "schema_version": 4,
  "source": {
-  "sha256": "3cc10137cd37bab0a78b5850e0639b75c4e29b13e8a1b78c79e641cf8180edc4",
+  "sha256": "863e25b438e9d1b535a53a19b34432dc88d67a1f79176f74007f08cf8e2d250c",
   "url": "https://lensfun.github.io/db/version_1.tar.bz2"
  },
- "updated": "2026-10-21T08:19:31Z"
+ "updated": "2026-10-24T07:55:18Z"
 }
